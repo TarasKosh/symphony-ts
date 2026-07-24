@@ -462,11 +462,16 @@ These fields take effect on the next poll tick without restarting Symphony:
 **GitHub capability preflight is on operator hold**
 - `github_cli_not_found`: install `gh` and make it resolvable in both the Symphony launch environment
   and the Codex command environment.
+- `github_remote_missing`: inspect the named ticket workspace and clone or configure its
+  GitHub-backed git remote. Repairing credentials does not fix this hold.
 - `github_auth_invalid`: with `credential_source: gh_auth_token`, run `gh auth login` again if the
   stored credential was revoked or expired. Otherwise provide a valid `GH_TOKEN` or `GITHUB_TOKEN`
   without writing it to workflow files or logs.
 - `github_permission_denied`: grant the authenticated identity push access to the workspace target
   repository, and resolve organization or SSO authorization requirements.
+- The hold reason may include a one-line, stderr-only GitHub CLI diagnostic excerpt. It is bounded
+  and credential-redacted; use it to distinguish workspace, authentication, permission, and
+  transient failures without expecting raw command output.
 - After correcting a deterministic failure, explicitly retry only the selected held issue with
   `POST /api/v1/holds/<url-encoded-issue-identifier>/retry`, or restart Symphony if the repaired
   environment is only available to a new process. The `gh_auth_token` source is re-read on the

@@ -362,6 +362,10 @@ describe("external command capability", () => {
     expect(
       isDeterministicCapabilityErrorCode(ERROR_CODES.githubPermissionDenied),
     ).toBe(true);
+    expect(
+      isDeterministicCapabilityErrorCode(ERROR_CODES.githubRemoteMissing),
+    ).toBe(true);
+    expect(isCapabilityErrorCode(ERROR_CODES.githubRemoteMissing)).toBe(true);
     expect(isCapabilityErrorCode(ERROR_CODES.githubCapabilityTransient)).toBe(
       true,
     );

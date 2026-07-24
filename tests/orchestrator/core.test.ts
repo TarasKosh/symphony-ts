@@ -450,6 +450,30 @@ describe("orchestrator core", () => {
     expect(timers.scheduled).toEqual([]);
   });
 
+  it("places a missing GitHub remote on operator hold with its diagnostic", async () => {
+    const timers = createFakeTimerScheduler();
+    const orchestrator = createOrchestrator({ timerScheduler: timers });
+    const reason =
+      "Required GitHub capability failed: ticket workspace 'ISSUE-1' has no GitHub-backed git remote. GitHub CLI diagnostic: no GitHub remote configured";
+
+    await orchestrator.pollTick();
+    const hold = orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      errorCode: ERROR_CODES.githubRemoteMissing,
+      reason,
+    });
+
+    expect(hold).toMatchObject({
+      issueId: "1",
+      attempt: 1,
+      error: `github_remote_missing: worker exited: ${reason}`,
+    });
+    expect(orchestrator.getState().retryAttempts["1"]).toBeUndefined();
+    expect(orchestrator.getState().operatorHolds["1"]).toEqual(hold);
+    expect(timers.scheduled).toEqual([]);
+  });
+
   it("suppresses polling while held and retries only the selected issue on explicit request", async () => {
     const timers = createFakeTimerScheduler();
     const orchestrator = createOrchestrator({ timerScheduler: timers });

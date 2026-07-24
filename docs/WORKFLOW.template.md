@@ -276,9 +276,13 @@ If `capabilities.github.required` is enabled, Symphony runs the GitHub check aft
 through `command/exec` on the same Codex app-server that will own the worker session. It uses the
 ticket workspace, inherited app-server environment, and prepared `turn_sandbox_policy`, and it must
 pass before `thread/start` or `turn/start`. Fix `gh` installation, authentication, repository push
-access, or sandbox network access, then retry only the selected held issue with
+access, the ticket workspace's missing GitHub-backed remote, or sandbox network access, then retry
+only the selected held issue with
 `POST /api/v1/holds/<url-encoded-issue-identifier>/retry`. Restart Symphony instead when the repaired
 environment is only available to a new process.
+
+GitHub hold reasons may retain a bounded, one-line, credential-redacted excerpt of stderr. Stdout
+and a standalone remediation hint such as `gh auth login` never prove an authentication failure.
 
 With `credential_source: gh_auth_token`, Symphony keeps the GitHub CLI token in memory only and
 re-reads it for a new worker or explicit retry. Non-empty `GH_TOKEN` and `GITHUB_TOKEN` values always
