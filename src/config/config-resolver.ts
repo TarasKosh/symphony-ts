@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, normalize, resolve, sep } from "node:path";
 
+import { isSafeExecutableBasename } from "../capabilities/external-command.js";
 import type { WorkflowDefinition } from "../domain/model.js";
 import { normalizeIssueState } from "../domain/model.js";
 import { ERROR_CODES } from "../errors/codes.js";
@@ -11,6 +12,7 @@ import {
 import {
   DEFAULT_ACTIVE_STATES,
   DEFAULT_CODEX_COMMAND,
+  DEFAULT_COMMAND_CAPABILITIES,
   DEFAULT_GITHUB_CAPABILITY_REQUIRED,
   DEFAULT_GITHUB_CREDENTIAL_SOURCE,
   DEFAULT_HOOK_TIMEOUT_MS,
@@ -41,6 +43,8 @@ import type {
   DispatchValidationResult,
   GithubCredentialSource,
   ResolvedWorkflowConfig,
+  WorkflowCommandCapabilities,
+  WorkflowCommandHook,
 } from "./types.js";
 
 const TRACKER_COMMON_CONFIG_KEYS = new Set([
@@ -56,11 +60,32 @@ const TRACKER_COMMON_CONFIG_KEYS = new Set([
   "terminal_states",
 ]);
 
+const COMMAND_DECLARATION_KEYS = new Set(["hooks", "agent", "probe_args"]);
+const COMMAND_HOOKS = new Map<string, WorkflowCommandHook>([
+  ["after_create", "afterCreate"],
+  ["before_run", "beforeRun"],
+  ["after_run", "afterRun"],
+  ["before_remove", "beforeRemove"],
+]);
+const RESOLVED_COMMAND_HOOKS = new Set(COMMAND_HOOKS.values());
+const RESOLVED_COMMAND_DECLARATION_KEYS = new Set([
+  "hooks",
+  "agent",
+  "probeArgs",
+]);
+const COMMAND_CAPABILITY_VALIDATION_ERROR = Symbol(
+  "commandCapabilityValidationError",
+);
+type ResolvedConfigWithCommandValidation = ResolvedWorkflowConfig & {
+  [COMMAND_CAPABILITY_VALIDATION_ERROR]?: string;
+};
+
 export function resolveWorkflowConfig(
   workflow: WorkflowDefinition & { workflowPath: string },
   environment: NodeJS.ProcessEnv = process.env,
 ): ResolvedWorkflowConfig {
   const config = workflow.config;
+  const commandCapabilities = readCommandCapabilities(config);
   const tracker = asRecord(config.tracker);
   const polling = asRecord(config.polling);
   const workspace = asRecord(config.workspace);
@@ -74,7 +99,7 @@ export function resolveWorkflowConfig(
   const trackerKind = readString(tracker.kind) ?? DEFAULT_TRACKER_KIND;
   const trackerApiKeyEnv = getTrackerAdapterApiKeyEnv(trackerKind);
 
-  return {
+  const resolved: ResolvedWorkflowConfig = {
     workflowPath: workflow.workflowPath,
     promptTemplate: workflow.promptTemplate,
     tracker: {
@@ -152,6 +177,7 @@ export function resolveWorkflowConfig(
         readInteger(codex.stall_timeout_ms) ?? DEFAULT_STALL_TIMEOUT_MS,
     },
     capabilities: {
+      commands: commandCapabilities.commands,
       github: {
         required:
           readBoolean(githubCapability.required) ??
@@ -176,11 +202,34 @@ export function resolveWorkflowConfig(
         DEFAULT_OBSERVABILITY_RENDER_INTERVAL_MS,
     },
   };
+
+  if (commandCapabilities.error !== null) {
+    Object.defineProperty(resolved, COMMAND_CAPABILITY_VALIDATION_ERROR, {
+      value: commandCapabilities.error,
+      enumerable: true,
+    });
+  }
+
+  return resolved;
 }
 
 export function validateDispatchConfig(
   config: ResolvedWorkflowConfig,
 ): DispatchValidationResult {
+  const commandCapabilityError =
+    (config as ResolvedConfigWithCommandValidation)[
+      COMMAND_CAPABILITY_VALIDATION_ERROR
+    ] ?? null;
+  if (commandCapabilityError !== null) {
+    return invalid(ERROR_CODES.configInvalid, commandCapabilityError);
+  }
+  const resolvedCommandError = validateResolvedCommandCapabilities(
+    config.capabilities.commands,
+  );
+  if (resolvedCommandError !== null) {
+    return invalid(ERROR_CODES.configInvalid, resolvedCommandError);
+  }
+
   const trackerValidation = validateTrackerAdapterConfig(config);
   if (trackerValidation !== null) {
     return invalid(trackerValidation.code, trackerValidation.message);
@@ -194,6 +243,227 @@ export function validateDispatchConfig(
   }
 
   return { ok: true };
+}
+
+function validateResolvedCommandCapabilities(
+  value: WorkflowCommandCapabilities | undefined,
+): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "capabilities.commands must be an executable-basename map.";
+  }
+
+  for (const [command, requirement] of Object.entries(value)) {
+    if (!isSafeExecutableBasename(command)) {
+      return "capabilities.commands contains an unsafe executable basename.";
+    }
+    if (
+      !requirement ||
+      typeof requirement !== "object" ||
+      !Array.isArray(requirement.hooks) ||
+      typeof requirement.agent !== "boolean" ||
+      !Array.isArray(requirement.probeArgs)
+    ) {
+      return "capabilities.commands contains a malformed resolved declaration.";
+    }
+    if (
+      Object.keys(requirement).some(
+        (key) => !RESOLVED_COMMAND_DECLARATION_KEYS.has(key),
+      )
+    ) {
+      return "A capabilities.commands declaration contains an unknown field.";
+    }
+
+    const seenHooks = new Set<WorkflowCommandHook>();
+    for (const hook of requirement.hooks) {
+      if (!RESOLVED_COMMAND_HOOKS.has(hook) || seenHooks.has(hook)) {
+        return "capabilities.commands hooks must be a unique list of supported hook names.";
+      }
+      seenHooks.add(hook);
+    }
+    if (
+      requirement.probeArgs.some(
+        (argument) =>
+          typeof argument !== "string" || containsAsciiControl(argument),
+      )
+    ) {
+      return "capabilities.commands probe_args must be a list of control-character-free strings.";
+    }
+    if (requirement.hooks.length === 0 && !requirement.agent) {
+      return "Each capabilities.commands declaration must enable a hook or agent boundary.";
+    }
+  }
+
+  return null;
+}
+
+function readCommandCapabilities(config: Record<string, unknown>): {
+  commands: WorkflowCommandCapabilities;
+  error: string | null;
+} {
+  if (!hasOwn(config, "capabilities")) {
+    return { commands: DEFAULT_COMMAND_CAPABILITIES, error: null };
+  }
+
+  const capabilities = strictRecord(config.capabilities);
+  if (capabilities === null) {
+    return invalidCommandCapabilities(
+      "capabilities must be an object when provided.",
+    );
+  }
+  if (!hasOwn(capabilities, "commands")) {
+    return { commands: DEFAULT_COMMAND_CAPABILITIES, error: null };
+  }
+
+  const commandMap = strictRecord(capabilities.commands);
+  if (commandMap === null) {
+    return invalidCommandCapabilities(
+      "capabilities.commands must be an executable-basename map.",
+    );
+  }
+  if (Object.keys(commandMap).length === 0) {
+    return { commands: DEFAULT_COMMAND_CAPABILITIES, error: null };
+  }
+
+  const normalized: Record<string, WorkflowCommandCapabilities[string]> = {};
+  for (const [command, rawDeclaration] of Object.entries(commandMap)) {
+    if (!isSafeExecutableBasename(command)) {
+      return invalidCommandCapabilities(
+        "capabilities.commands contains an unsafe executable basename.",
+      );
+    }
+
+    const declaration = strictRecord(rawDeclaration);
+    if (declaration === null) {
+      return invalidCommandCapabilities(
+        "Each capabilities.commands declaration must be an object.",
+      );
+    }
+    if (
+      Object.keys(declaration).some((key) => !COMMAND_DECLARATION_KEYS.has(key))
+    ) {
+      return invalidCommandCapabilities(
+        "A capabilities.commands declaration contains an unknown field.",
+      );
+    }
+
+    const hooks = readCommandHooks(declaration);
+    if (hooks === null) {
+      return invalidCommandCapabilities(
+        "capabilities.commands hooks must be a unique list of supported hook names.",
+      );
+    }
+    const agent =
+      declaration.agent === undefined
+        ? false
+        : typeof declaration.agent === "boolean"
+          ? declaration.agent
+          : null;
+    if (agent === null) {
+      return invalidCommandCapabilities(
+        "capabilities.commands agent must be a boolean.",
+      );
+    }
+    const probeArgs = readProbeArgs(declaration.probe_args);
+    if (probeArgs === null) {
+      return invalidCommandCapabilities(
+        "capabilities.commands probe_args must be a list of control-character-free strings.",
+      );
+    }
+    if (hooks.length === 0 && !agent) {
+      return invalidCommandCapabilities(
+        "Each capabilities.commands declaration must enable a hook or agent boundary.",
+      );
+    }
+
+    normalized[command] = Object.freeze({
+      hooks: Object.freeze(hooks),
+      agent,
+      probeArgs: Object.freeze(probeArgs),
+    });
+  }
+
+  return {
+    commands: Object.freeze(normalized),
+    error: null,
+  };
+}
+
+function readCommandHooks(
+  declaration: Record<string, unknown>,
+): WorkflowCommandHook[] | null {
+  if (declaration.hooks === undefined) {
+    return [];
+  }
+  if (!Array.isArray(declaration.hooks)) {
+    return null;
+  }
+
+  const hooks: WorkflowCommandHook[] = [];
+  const seen = new Set<WorkflowCommandHook>();
+  for (const rawHook of declaration.hooks) {
+    if (typeof rawHook !== "string") {
+      return null;
+    }
+    const hook = COMMAND_HOOKS.get(rawHook);
+    if (hook === undefined || seen.has(hook)) {
+      return null;
+    }
+    hooks.push(hook);
+    seen.add(hook);
+  }
+  return hooks;
+}
+
+function readProbeArgs(value: unknown): string[] | null {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const args: string[] = [];
+  for (const argument of value) {
+    if (typeof argument !== "string" || containsAsciiControl(argument)) {
+      return null;
+    }
+    args.push(argument);
+  }
+  return args;
+}
+
+function containsAsciiControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.charCodeAt(index);
+    if (codePoint <= 0x1f || codePoint === 0x7f) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function invalidCommandCapabilities(error: string): {
+  commands: WorkflowCommandCapabilities;
+  error: string;
+} {
+  return {
+    commands: DEFAULT_COMMAND_CAPABILITIES,
+    error,
+  };
+}
+
+function strictRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function invalid(code: string, message: string): DispatchValidationResult {

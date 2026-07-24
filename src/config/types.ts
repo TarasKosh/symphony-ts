@@ -45,7 +45,28 @@ export interface WorkflowCodexConfig {
   stallTimeoutMs: number;
 }
 
+export type WorkflowCommandHook =
+  | "afterCreate"
+  | "beforeRun"
+  | "afterRun"
+  | "beforeRemove";
+
+export interface WorkflowCommandCapability {
+  hooks: readonly WorkflowCommandHook[];
+  agent: boolean;
+  probeArgs: readonly string[];
+}
+
+export type WorkflowCommandCapabilities = Readonly<
+  Record<string, WorkflowCommandCapability>
+>;
+
 export interface WorkflowCapabilitiesConfig {
+  /**
+   * Optional only for backwards-compatible programmatic construction.
+   * The workflow resolver always supplies the frozen empty default.
+   */
+  commands?: WorkflowCommandCapabilities;
   github: {
     required: boolean;
     credentialSource: GithubCredentialSource;

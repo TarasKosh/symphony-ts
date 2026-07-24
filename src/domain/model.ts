@@ -1,3 +1,5 @@
+import type { CapabilityFailureMetadata } from "../capabilities/external-command.js";
+
 export const ORCHESTRATOR_ISSUE_STATUSES = [
   "unclaimed",
   "claimed",
@@ -106,6 +108,7 @@ export interface RetryEntry {
   dueAtMs: number;
   timerHandle: ReturnType<typeof setTimeout> | null;
   error: string | null;
+  capabilityFailure?: CapabilityFailureMetadata;
 }
 
 export interface OperatorHoldEntry {
@@ -114,6 +117,7 @@ export interface OperatorHoldEntry {
   attempt: number;
   heldAtMs: number;
   error: string;
+  capabilityFailure?: CapabilityFailureMetadata;
 }
 
 export interface CodexTotals {

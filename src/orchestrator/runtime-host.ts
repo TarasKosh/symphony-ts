@@ -5,6 +5,8 @@ import type { Writable } from "node:stream";
 
 import type { AgentRunResult, AgentRunnerEvent } from "../agent/runner.js";
 import { AgentRunner } from "../agent/runner.js";
+import type { CapabilityFailureMetadata } from "../capabilities/external-command.js";
+import { getCommandCapabilities } from "../capabilities/external-command.js";
 import { validateDispatchConfig } from "../config/config-resolver.js";
 import type { ResolvedWorkflowConfig } from "../config/types.js";
 import { WorkflowWatcher } from "../config/workflow-watch.js";
@@ -182,6 +184,9 @@ export class OrchestratorRuntimeHost implements DashboardServerHost {
           cleanupWorkspace: input.cleanupWorkspace,
           reason: input.reason,
         });
+      },
+      cleanupHeldIssue: async ({ issueId }) => {
+        await this.workspaceManager.removeForIssue(issueId);
       },
     };
 
@@ -420,7 +425,9 @@ export class OrchestratorRuntimeHost implements DashboardServerHost {
     this.workers.delete(execution.issueId);
     const lifecycleFailure = getLifecycleFailure(execution.lastResult);
     const errorCode = extractErrorCode(execution.lastError);
-    const capability = extractCapability(execution.lastError);
+    const capabilityFailure = extractCapabilityFailure(execution.lastError);
+    const capability =
+      capabilityFailure?.capability ?? extractCapability(execution.lastError);
 
     await this.logger?.log(
       lifecycleFailure !== null
@@ -448,6 +455,13 @@ export class OrchestratorRuntimeHost implements DashboardServerHost {
         ...(input.reason === undefined ? {} : { reason: input.reason }),
         ...(errorCode === null ? {} : { error_code: errorCode }),
         ...(capability === null ? {} : { capability }),
+        ...(capabilityFailure === null
+          ? {}
+          : {
+              command: capabilityFailure.command,
+              boundary: capabilityFailure.boundary,
+              remediation: capabilityFailure.remediation,
+            }),
         ...(lifecycleFailure === null
           ? {}
           : {
@@ -470,6 +484,7 @@ export class OrchestratorRuntimeHost implements DashboardServerHost {
       outcome: input.outcome,
       ...(input.reason === undefined ? {} : { reason: input.reason }),
       ...(errorCode === null ? {} : { errorCode }),
+      ...(capabilityFailure === null ? {} : { capabilityFailure }),
       endedAt: input.endedAt ?? this.now(),
       handoff: execution.lastResult?.handoff ?? null,
       blocker: execution.lastResult?.blocker ?? null,
@@ -846,6 +861,7 @@ function createWorkspaceManagerFromConfig(
     root: config.workspace.root,
     hooks: new WorkspaceHookRunner({
       config: config.hooks,
+      commands: getCommandCapabilities(config),
       ...(logger === undefined || logger === null
         ? {}
         : {
@@ -906,6 +922,10 @@ function createWorkspaceHookLogger(logger: StructuredLogger): (entry: {
   errorCode?: string;
   stdout?: string;
   stderr?: string;
+  capability?: string;
+  command?: string;
+  boundary?: string;
+  remediation?: string;
 }) => void {
   return (entry) => {
     void logger.log(
@@ -927,6 +947,14 @@ function createWorkspaceHookLogger(logger: StructuredLogger): (entry: {
         ...(entry.errorCode === undefined
           ? {}
           : { error_code: entry.errorCode }),
+        ...(entry.capability === undefined
+          ? {}
+          : { capability: entry.capability }),
+        ...(entry.command === undefined ? {} : { command: entry.command }),
+        ...(entry.boundary === undefined ? {} : { boundary: entry.boundary }),
+        ...(entry.remediation === undefined
+          ? {}
+          : { remediation: entry.remediation }),
       },
     );
   };
@@ -1064,6 +1092,9 @@ function toRetryIssueDetail(
       attempt: retry.attempt,
       due_at: new Date(retry.dueAtMs).toISOString(),
       error: retry.error,
+      ...(retry.capabilityFailure === undefined
+        ? {}
+        : { capability_failure: { ...retry.capabilityFailure } }),
     },
     hold: null,
     logs: {
@@ -1094,6 +1125,9 @@ function toHoldIssueDetail(
       attempt: hold.attempt,
       held_at: new Date(hold.heldAtMs).toISOString(),
       error: hold.error,
+      ...(hold.capabilityFailure === undefined
+        ? {}
+        : { capability_failure: { ...hold.capabilityFailure } }),
     },
     logs: {
       codex_session_logs: [],
@@ -1241,6 +1275,43 @@ function extractCapability(error: unknown): string | null {
   }
 
   return null;
+}
+
+function extractCapabilityFailure(
+  error: unknown,
+): CapabilityFailureMetadata | null {
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+
+  const candidate =
+    "capabilityFailure" in error &&
+    typeof error.capabilityFailure === "object" &&
+    error.capabilityFailure !== null
+      ? error.capabilityFailure
+      : error;
+  if (
+    !("code" in candidate) ||
+    typeof candidate.code !== "string" ||
+    !("capability" in candidate) ||
+    candidate.capability !== "external_command" ||
+    !("command" in candidate) ||
+    typeof candidate.command !== "string" ||
+    !("boundary" in candidate) ||
+    typeof candidate.boundary !== "string" ||
+    !("remediation" in candidate) ||
+    typeof candidate.remediation !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    code: candidate.code,
+    capability: candidate.capability,
+    command: candidate.command,
+    boundary: candidate.boundary as CapabilityFailureMetadata["boundary"],
+    remediation: candidate.remediation,
+  };
 }
 
 function supportsConfigUpdate(
