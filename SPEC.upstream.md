@@ -1036,23 +1036,153 @@ Algorithm summary:
 
 1. Sanitize the implementation-selected stable input to `workspace_key`.
 2. Compute workspace path under workspace root.
-3. Ensure the workspace path exists as a directory.
+3. Serialize create, recovery, state transition, and explicit removal through a process-wide
+   lifecycle coordinator keyed by normalized workspace root plus workspace key. If the workspace is
+   missing, persist an `in_progress` reservation with a unique generation before creating the
+   directory, then bind that state to the directory's no-follow filesystem identity before running
+   `after_create`.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
-6. If a declared `after_create` command preflight or hook fails and the directory was created by
-   this call, re-resolve and revalidate the exact workspace path and root containment, verify the
-   directory is still empty, then remove it with a non-recursive empty-directory operation.
-   Preserve any pre-existing or populated workspace. An atomic non-recursive removal failure (for
-   example, a concurrent file appeared) must preserve the directory and must not mask the original
-   typed capability error. A later explicit retry recreates a successfully removed workspace and
-   reruns `after_create`.
+5. If `created_now=true`, run `after_create` if configured, then atomically promote the same
+   generation to `ready` only after the hook succeeds. A workspace with no configured
+   `after_create` hook is promoted immediately.
+6. If a declared `after_create` command preflight, hook, or `ready` promotion fails and this call
+   created the directory, re-resolve and revalidate the exact workspace path, verify the matching
+   generation and directory identity, atomically rename that path into the generation-specific
+   manager recovery quarantine, verify the moved identity again, then recursively remove it even if
+   the failed hook populated it. Cleanup remains best-effort and must never mask the original typed
+   capability or hook error.
+7. After acquiring the lifecycle coordinator, if an existing workspace has valid `in_progress`
+   state with a matching non-null identity, emit `workspace_provisioning_incomplete` with
+   `outcome=recovering`, revalidate its path and directory identity, move it through the same
+   identity-checked recovery quarantine, recreate it, and emit `outcome=recovered` only after the
+   new generation reaches `ready`. An `in_progress` reservation with `directoryIdentity=null`
+   follows the separate empty-versus-populated lifecycle-table outcomes below.
+8. A missing provisioning marker always denotes a legacy workspace and must be reused without
+   destructive recovery or rerunning `after_create`, regardless of its contents. A valid `ready`
+   marker whose identity still matches is also reused. This preserves workspaces created by
+   versions that predate explicit provisioning state; workspace contents or VCS metadata must not
+   be used as a health heuristic.
+9. Malformed, unknown-version, unreadable, path/key-mismatched, or identity-mismatched state is never
+   a deletion authority. Preserve the workspace, emit `workspace_provisioning_incomplete` with
+   `outcome=failed`, and fail with the same error code and fixed operator remediation before agent
+   capability checks. The orchestrator treats this code as an operator hold rather than an automatic
+   retry.
 
 Notes:
 
 - This section does not assume any specific repository/VCS workflow.
 - Workspace preparation beyond directory creation (for example dependency bootstrap, checkout/sync,
   code generation) is implementation-defined and is typically handled via hooks.
+
+#### TypeScript provisioning-state contract
+
+The TypeScript implementation stores state at
+`<workspace_root>/.symphony+/provisioning/<workspace_key>.json`. The `+` cannot occur in a sanitized
+workspace key, so the manager control directory cannot collide with a per-issue workspace. State is
+outside the per-issue workspace so `after_create` starts with an empty working directory.
+
+State records use a strict discriminated version-1 JSON schema. Reservations use:
+
+```json
+{
+  "version": 1,
+  "state": "in_progress",
+  "workspaceKey": "stable-sanitized-key",
+  "workspacePath": "/normalized/absolute/workspace/path",
+  "generation": "cryptographically-random-id",
+  "directoryIdentity": null
+}
+```
+
+After directory creation, `directoryIdentity` is:
+
+```json
+{
+  "dev": "decimal-bigint",
+  "ino": "decimal-bigint",
+  "birthtimeNs": "decimal-bigint"
+}
+```
+
+`ready` requires that identity object; `in_progress` permits the object or `null` only for the short
+reservation before directory creation. All shown fields are required, no additional fields are
+accepted, strings must be non-empty, and `version`, `state`, and every field type must match exactly.
+`generation` must match the lower-case UUID v4 grammar
+`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$` before it is used in any
+control path; separators, traversal segments, and all other values are malformed state. Identity
+values are exact decimal strings from Node `lstat(..., { bigint: true })`.
+
+State creation and transition use a temporary file plus same-directory atomic rename. A module-wide
+coordinator serializes all manager instances in the process, including instances replaced during
+workflow reload, and covers `createForIssue`, recovery, cleanup, state changes, and `removeForIssue`.
+After acquiring that coordinator, an `in_progress` record belongs to an abandoned earlier
+invocation and may be recovered only if its bindings still match. Running multiple Symphony
+processes against the same workspace root is outside this implementation profile.
+
+The lifecycle is:
+
+| Observed workspace/state | Required behavior |
+| --- | --- |
+| Missing workspace; no state | Provision a new generation |
+| Missing workspace; valid stale `in_progress` or `ready` state | Remove any matching recovery-quarantine residue, replace that control record, and provision a new generation |
+| Existing workspace; no state | Reuse as legacy; never run `after_create` or delete it |
+| Existing workspace; matching `ready` state | Reuse without rerunning `after_create` |
+| Existing workspace; matching `in_progress` state | Recursively remove that exact identity, then provision a new generation |
+| Existing empty workspace; `in_progress` reservation with no identity | Remove with a non-recursive empty-directory operation, then provision |
+| Existing populated workspace; reservation with no identity | Preserve and fail as `workspace_provisioning_incomplete` |
+| Invalid, unreadable, symlinked, or identity-mismatched state | Preserve all workspace data and fail as `workspace_provisioning_incomplete` |
+
+Only a matching state generation plus matching no-follow identity authorizes recursive recovery.
+The implementation atomically renames the workspace to
+`.symphony+/recovery/<workspace_key>-<generation>`, then verifies the moved identity before recursive
+deletion. Before the move, the destination must be absent; an existing target while the workspace
+also exists is preserved alongside the workspace and fails closed rather than relying on
+platform-specific rename-overwrite behavior. A mismatch is preserved in quarantine and fails for
+operator action. The manager control namespace is trusted and reserved for Symphony; hooks must not
+mutate it. Successful
+current-attempt cleanup or explicit workspace removal deletes the matching state after the
+workspace path is gone. If state deletion then fails, a later create may replace that valid record
+because the workspace path is absent; no user workspace data is deleted in that case. Failed
+workspace cleanup leaves `in_progress` state and any matching quarantine residue for a later
+invocation. Workspace and control paths are checked with no-follow `lstat`: the workspace/control
+directory must be a real directory, the state must be a real regular file, and symlinks or
+unavailable identity fields fail closed. The implementation rereads the state and compares the
+exact `dev`, `ino`, and `birthtimeNs` strings immediately before the atomic move and after it. The
+fixed remediation is: `Inspect the workspace and Symphony provisioning state; remove the workspace
+only after verifying it is safe, then retry.`
+
+During later-invocation recovery, any quarantine collision, move failure, post-move identity failure,
+or recursive-delete failure emits `outcome=failed` and throws
+`workspace_provisioning_incomplete` with the fixed remediation, which enters operator hold instead
+of generic retry. During best-effort cleanup of the current failed `after_create`, the same
+diagnostic is emitted but the original hook or capability error remains the attempt result.
+
+Provisioning diagnostics use this callback payload:
+
+```ts
+type WorkspaceProvisioningLogger = (entry: {
+  level: "info" | "warn" | "error";
+  event: "workspace_provisioning_incomplete";
+  outcome: "recovering" | "recovered" | "failed";
+  issueId: string;
+  workspacePath: string;
+  errorCode: "workspace_provisioning_incomplete";
+  remediation: string;
+}) => void;
+```
+
+`WorkspaceManagerOptions` exposes the callback as
+`provisioningLogger?: WorkspaceProvisioningLogger`. `recovering` is emitted at `warn`, `recovered`
+at `info`, and `failed` at `error`. `runtime-host` forwards it to the structured logger, and
+the error is transported as a `WorkspacePathError` with
+`ERROR_CODES.workspaceProvisioningIncomplete = "workspace_provisioning_incomplete"` and the fixed
+remediation in its message. In `orchestrator/core`, an explicit
+`errorCode === ERROR_CODES.workspaceProvisioningIncomplete` branch runs before deterministic
+capability and generic retry classification. It creates an operator hold whose `error` begins with
+the exact code and whose `capabilityFailure` is absent. The code remains present in the hold
+error/status path and structured worker-exit logs. This change does not alter GitHub capability
+classification, and `src/agent/github-capability.ts` remains untouched.
 
 ### 9.3 Optional Workspace Population (Implementation-Defined)
 
@@ -1064,12 +1194,12 @@ hooks (for example `after_create` and/or `before_run`).
 Failure handling:
 
 - Workspace population/synchronization failures return an error for the current attempt.
-- The standard `after_create` hook failure path may remove only the newly created, still-empty
-  directory through the non-recursive safeguards in Section 9.2. Any broader cleanup of an
-  implementation-defined population step is a separate explicit policy and must preserve the
+- The standard `after_create` hook failure path may recursively remove a workspace only when the
+  current invocation created it, using the safeguards in Section 9.2, and must preserve the
   original failure.
-- Reused workspaces should not be destructively reset on population failure unless that policy is
-  explicitly chosen and documented.
+- A reused workspace may be reset only when valid manager-owned state explicitly identifies an
+  interrupted provisioning attempt. Markerless legacy workspaces and workspaces marked `ready`
+  must not be destructively reset.
 
 ### 9.4 Workspace Hooks
 
@@ -1108,7 +1238,7 @@ Command-capability scheduling semantics:
 
 | Hook | Check timing | Failure effect |
 | --- | --- | --- |
-| `after_create` | In the new workspace's hook invocation, before its body and tracker claim | Fatal; deterministic failures hold, transient failures retry; remove only the exact newly-created still-empty directory |
+| `after_create` | In the new workspace's hook invocation, before its body and tracker claim | Fatal; deterministic failures hold, transient failures retry; failure cleanup may remove only the identity-matched generation installed by this invocation; interrupted existing generations are recovered before this hook starts |
 | `before_run` | In the attempt's hook invocation, before its body and tracker claim | Fatal; deterministic failures hold, transient failures retry |
 | `after_run` | In the post-attempt hook invocation, before its body | Best-effort log only; never changes the attempt result or creates a hold |
 | `before_remove` | In the cleanup hook invocation, before its body | Best-effort log only; never creates a hold or prevents cleanup |
@@ -2443,14 +2573,35 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   implementation policy)
 - Optional workspace population/synchronization errors are surfaced
 - Temporary artifacts (`tmp`, `.elixir_ls`) are removed during prep
-- `after_create` hook runs only on new workspace creation
-- A newly created, still-empty workspace is removed when `after_create` command preflight fails;
-  retry recreates it and reruns `after_create`
-- The same empty-directory recovery applies to an ordinary `after_create` hook-body failure
+- `after_create` hook runs only on new workspace creation, including recreation of a workspace with
+  valid interrupted-provisioning state
+- Provisioning state is recorded outside the per-issue workspace as `in_progress` before
+  `after_create` and promoted to `ready` only after success
+- A workspace created by the current invocation is recursively removed when `after_create` command
+  preflight or hook-body execution fails, even if the failed hook populated it; retry recreates it
+  and reruns `after_create`
 - The original typed `required_command_*` error and sanitized metadata survive `after_create`
-  recovery, including a failed empty-directory removal, and are never replaced by
+  recovery, including a failed recursive removal, and are never replaced by
   `workspace_create_failed`
-- A pre-existing or populated workspace is never deleted by `after_create` failure recovery
+- An existing workspace with valid `in_progress` state is recovered before worker preflight and
+  emits the greppable `workspace_provisioning_incomplete` diagnostic
+- A markerless legacy workspace or workspace marked `ready` is never deleted or re-provisioned
+- Invalid, unreadable, symlinked, path/key-mismatched, or directory-identity-mismatched state preserves
+  workspace data and enters operator hold as `workspace_provisioning_incomplete`
+- A fresh creation runs `after_create` once and reaches `ready`
+- A current-attempt hook failure that populated the workspace recursively removes that owned
+  generation without replacing the original hook/capability error
+- A matching leftover `in_progress` workspace is recovered and re-provisioned instead of silently
+  skipping `after_create`
+- A populated markerless legacy workspace remains untouched and is not re-provisioned
+- Additional tests preserve identity-mismatched workspaces, assert exact recovery diagnostics and
+  state removal, classify the dedicated error as operator hold, and serialize two manager instances
+  for one normalized root/key across create and remove
+- Malformed generations, including separators and traversal payloads, preserve workspace data and
+  fail before a recovery path is constructed
+- Quarantine collisions and recovery move/identity/delete failures preserve data, emit the exact
+  failed diagnostic, and enter operator hold; the corresponding current-attempt cleanup failure
+  still preserves the original hook/capability error
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - Hook-shell launch rejection is reported as `hook_failed`, not `hook_timed_out`
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored

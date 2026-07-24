@@ -485,6 +485,14 @@ export class OrchestratorCore {
     }
 
     const errorCode = input.capabilityFailure?.code ?? input.errorCode;
+    if (errorCode === ERROR_CODES.workspaceProvisioningIncomplete) {
+      return this.holdForOperatorAction(input.issueId, {
+        attempt: nextRetryAttempt(runningEntry.retryAttempt),
+        identifier: runningEntry.identifier,
+        error: `${ERROR_CODES.workspaceProvisioningIncomplete}: ${formatWorkerExitReason(input.reason)}`,
+      });
+    }
+
     if (isDeterministicCapabilityErrorCode(errorCode)) {
       return this.holdForOperatorAction(input.issueId, {
         attempt: nextRetryAttempt(runningEntry.retryAttempt),

@@ -217,7 +217,7 @@ Acceptance:
 
 ### Task 10: Add Boundary-Scoped External Command Preflight
 
-Status: Complete
+Status: In Progress
 
 - Add an opt-in `capabilities.commands` map whose safe executable-basename keys declare hook
   boundaries, an agent boundary, and direct agent probe arguments.
@@ -231,8 +231,20 @@ Status: Complete
 - Propagate sanitized capability, command, boundary, code, and remediation metadata through logs,
   hold state, snapshots, and operator-facing status without raw PATH, probe output, hook output,
   argv values, or credentials.
-- Remove only a newly created, still-empty workspace after a fatal `after_create` failure so an
-  explicit retry recreates it and reruns bootstrap; preserve pre-existing and populated workspaces.
+- Persist manager-owned provisioning state outside the per-issue directory, recursively remove a
+  workspace only when the current invocation created it or valid state identifies interrupted
+  provisioning, and rerun bootstrap after deterministic recovery. Preserve markerless legacy and
+  ready workspaces.
+- Bind versioned provisioning state to the stable key, normalized path, unique generation, and exact
+  no-follow directory identity; serialize same-key create/remove operations across manager instances
+  in the process and preserve data whenever ownership is invalid or unverifiable.
+- Emit `workspace_provisioning_incomplete` with structured recovery outcomes and fixed remediation,
+  and hold unrecoverable state for operator action before agent capability checks.
+- Add `WorkspaceManagerOptions.provisioningLogger`, map recovering/recovered/failed to
+  warn/info/error, and forward it through `runtime-host`.
+- Add `workspaceProvisioningIncomplete` to the shared error-code taxonomy, transport it as a
+  workspace error without capability metadata, and map it to deterministic operator hold before the
+  generic retry branch. Keep `src/agent/github-capability.ts` unchanged.
 - Preserve typed `after_create` capability errors, distinguish hook launch rejection from timeout,
   and retain capability diagnostics at the worker log boundary.
 - Document why Symphony validates declared requirements but does not inject a private Codex-bundled
@@ -251,8 +263,17 @@ Acceptance:
   a timer; `required_command_capability_transient` uses normal backoff.
 - Windows agent probes resolve extensionless `rg` as `rg.exe` and use the bounded Windows timeout.
 - Tests prove deterministic/transient classification, boundary separation, sanitized diagnostics,
-  empty-workspace recovery, explicit retry behavior, and byte-for-byte unchanged hook scripts when
-  no commands are declared.
+  populated-workspace cleanup for current-invocation failures, interrupted-provisioning recovery,
+  markerless legacy preservation, explicit retry behavior, and byte-for-byte unchanged hook scripts
+  when no commands are declared.
+- Tests name and cover fresh `after_create`, populated current-attempt failure cleanup, matching
+  `in_progress` recovery, populated markerless legacy preservation, identity-mismatch preservation,
+  exact structured diagnostics, state removal, two-manager serialization, and operator-hold
+  classification for unrecoverable provisioning state. Malformed generation/path payloads fail
+  before control-path construction and never authorize workspace deletion.
+- Tests fail closed on an existing quarantine target and on recovery move, identity, or recursive
+  deletion errors; later recovery enters the dedicated hold while current-attempt cleanup retains
+  the original hook/capability error.
 - Tests prove combined generic/GitHub credential-environment ordering, no duplicate concurrent
   preflight, and held-issue release/cleanup when tracker eligibility changes.
 - Retry tests cover invalid config, issue-specific ineligibility release, and preserving a selected
