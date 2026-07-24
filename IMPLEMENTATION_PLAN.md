@@ -211,3 +211,47 @@ Acceptance:
   network failures produce distinct machine-readable error codes and actionable messages.
 - Workflow templates and operator documentation explain how to declare required capabilities and
   how to recover a held ticket after credentials are repaired.
+
+### Task 10: Add Boundary-Scoped External Command Preflight
+
+Status: Complete
+
+- Add an opt-in `capabilities.commands` map whose safe executable-basename keys declare hook
+  boundaries, an agent boundary, and direct agent probe arguments.
+- Keep omission a true no-op with no added shell payload, subprocess, app-server startup, tracker
+  claim deferral, or runtime dependency.
+- Check hook requirements before the hook body inside the same `sh -lc` invocation and explicit
+  environment; check agent requirements through the same Codex app-server, cwd, prepared sandbox,
+  and inherited environment as the later turn.
+- Classify missing and execution-denied commands as deterministic operator holds, and classify
+  timeout, protocol, and genuinely unclassified failures as transient retryable failures.
+- Propagate sanitized capability, command, boundary, code, and remediation metadata through logs,
+  hold state, snapshots, and operator-facing status without raw PATH, probe output, hook output,
+  argv values, or credentials.
+- Remove only a newly created, still-empty workspace after a fatal `after_create` failure so an
+  explicit retry recreates it and reruns bootstrap; preserve pre-existing and populated workspaces.
+- Preserve typed `after_create` capability errors, distinguish hook launch rejection from timeout,
+  and retain capability diagnostics at the worker log boundary.
+- Document why Symphony validates declared requirements but does not inject a private Codex-bundled
+  executable.
+
+Acceptance:
+
+- `after_create`, `before_run`, and agent declarations are checked independently in their real
+  execution boundaries before tracker lifecycle claim or substantive agent work, while the
+  orchestrator reserves the issue and worker slot locally before preflight begins.
+- `after_run` and `before_remove` declarations are checked in their later real hook boundaries and
+  retain best-effort log-only semantics without retroactively changing an attempt or blocking
+  cleanup.
+- Unsafe or malformed command declarations fail dispatch as `config_invalid`.
+- `required_command_not_found` and `required_command_execution_denied` enter operator hold without
+  a timer; `required_command_capability_transient` uses normal backoff.
+- Windows agent probes resolve extensionless `rg` as `rg.exe` and use the bounded Windows timeout.
+- Tests prove deterministic/transient classification, boundary separation, sanitized diagnostics,
+  empty-workspace recovery, explicit retry behavior, and byte-for-byte unchanged hook scripts when
+  no commands are declared.
+- Tests prove combined generic/GitHub credential-environment ordering, no duplicate concurrent
+  preflight, and held-issue release/cleanup when tracker eligibility changes.
+- Retry tests cover invalid config, issue-specific ineligibility release, and preserving a selected
+  hold when no worker slot is available.
+- `pnpm typecheck`, `pnpm lint`, `pnpm build`, and `pnpm test` pass before the pull request opens.
