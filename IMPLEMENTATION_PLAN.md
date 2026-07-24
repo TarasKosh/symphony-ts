@@ -188,7 +188,8 @@ Status: Complete
 - For the GitHub capability, verify the authenticated identity and non-mutating repository access,
   including whether the account can push, without logging tokens or other credential material.
 - Distinguish deterministic operator-action failures such as missing credentials, expired tokens,
-  and repository permission denial from transient network or provider failures.
+  missing GitHub-backed workspace remotes, and repository permission denial from transient network
+  or provider failures.
 - Put deterministic capability failures into an operator hold before substantive agent work starts,
   and suppress automatic continuation while the failure signature is unchanged.
 - Surface the failed capability, effective executable/config context, remediation guidance, and hold
@@ -207,8 +208,10 @@ Acceptance:
   checks and allows the normal worker lifecycle to continue.
 - Credential precedence cases such as keyring state, `GH_TOKEN`, `GITHUB_TOKEN`, and alternate
   config directories are covered without exposing secret values in logs, errors, or the dashboard.
-- Missing executables, invalid credentials, insufficient repository permissions, and transient
-  network failures produce distinct machine-readable error codes and actionable messages.
+- Missing executables, missing GitHub-backed workspace remotes, invalid credentials, insufficient
+  repository permissions, and transient network failures produce distinct machine-readable error
+  codes and actionable messages. GitHub failures retain a bounded, credential-redacted stderr
+  excerpt without allowing stdout or remediation hints to poison classification.
 - Workflow templates and operator documentation explain how to declare required capabilities and
   how to recover a held ticket after credentials are repaired.
 

@@ -43,6 +43,7 @@ export const ERROR_CODES = {
   hookTimedOut: "hook_timed_out",
   promptRenderFailed: "prompt_render_failed",
   githubCliNotFound: "github_cli_not_found",
+  githubRemoteMissing: "github_remote_missing",
   githubAuthInvalid: "github_auth_invalid",
   githubPermissionDenied: "github_permission_denied",
   githubCapabilityTransient: "github_capability_transient",

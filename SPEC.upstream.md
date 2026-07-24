@@ -592,6 +592,18 @@ startup behavior.
   - Probe output is bounded to 64 KiB per stream where custom command caps are supported. Windows
     sandbox execution uses the app-server's built-in bounded capture because current Codex versions
     reject a custom `outputBytesCap` there.
+  - Failure classification inspects only the bounded stderr prefix. Stdout never supplies
+    authentication, permission, repository, or executable evidence and is never copied into an
+    operator diagnostic. A remediation hint such as `gh auth login` is not authentication-failure
+    evidence by itself.
+  - During the repository-resolution step, the exact GitHub CLI diagnostics for no GitHub-backed
+    remote or for a non-git workspace map to deterministic `github_remote_missing`. The
+    operator-facing message names the sanitized ticket-workspace basename and distinguishes this
+    condition from authentication failure.
+  - A GitHub capability error may append a normalized, credential-redacted excerpt from that
+    bounded stderr prefix. Redaction happens before excerpt truncation; the excerpt is at most 2048
+    UTF-8 bytes and never contains token-shaped values, authorization material, raw stdout, or
+    executor metadata.
   - Each GitHub probe command uses a `60000` ms command timeout on Windows and `15000` ms elsewhere.
     The client-side `command/exec` response timer adds `read_timeout_ms` to that command budget so
     the outer JSON-RPC wait cannot expire before the bounded command itself.
@@ -1838,6 +1850,8 @@ API design notes:
      app-server protocol failed, or the result could not be classified deterministically.
    - `github_cli_not_found`: `gh` cannot be resolved where the configured credential is loaded or
      in the Codex command environment.
+   - `github_remote_missing`: the ticket workspace is not a git repository or has no
+     GitHub-backed remote during repository resolution.
    - `github_auth_invalid`: authentication is missing, invalid, expired, or returns HTTP 401.
    - `github_permission_denied`: repository access returns HTTP 403 or push permission is false.
    - `github_capability_transient`: timeout, network, provider, or unclassified probe failure.
@@ -1870,7 +1884,9 @@ Sanitized capability metadata:
 - `remediation`: fixed actionable guidance derived only from safe declaration and boundary values.
 
 The metadata object contains no optional raw diagnostic bag. Resolved executable paths, PATH,
-stdout/stderr, probe argv, environment values, and credentials are forbidden.
+probe argv, environment values, and credentials are forbidden. A GitHub capability error's
+compatibility message may contain only the bounded, normalized, credential-redacted stderr excerpt
+defined in Section 5; raw stdout/stderr and executor metadata remain forbidden.
 
 ### 14.2 Recovery Behavior
 
@@ -1884,13 +1900,15 @@ stdout/stderr, probe argv, environment values, and credentials are forbidden.
 
 - External capability failures:
   - Put `required_command_not_found`, `required_command_execution_denied`,
-    `github_cli_not_found`, `github_auth_invalid`, and `github_permission_denied` into the existing
-    operator hold with no automatic retry timer.
+    `github_cli_not_found`, `github_remote_missing`, `github_auth_invalid`, and
+    `github_permission_denied` into the existing operator hold with no automatic retry timer.
   - Retry `required_command_capability_transient` and `github_capability_transient` using the normal
     failure backoff.
   - Expose only the capability name, stable error code, and sanitized command/boundary/remediation
-    context in logs and retry/status data. Never include PATH, probe or hook output, probe argv,
-    tokens, authorization headers, or credential environment values.
+    context in logs and retry/status data. GitHub failures may additionally expose the bounded,
+    normalized, credential-redacted stderr excerpt defined in Section 5. Never include PATH, raw
+    stdout/stderr, hook output, probe argv, tokens, authorization headers, credential environment
+    values, or executor metadata.
   - A deterministic fatal capability failure atomically removes any retry entry, creates an
     `operator_holds` entry with no timer, and keeps the issue claimed.
   - An explicit retry targets exactly one hold, re-fetches eligibility, and reruns all applicable
@@ -2535,6 +2553,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Required-command failures expose only stable sanitized code/capability/command/boundary/remediation
   fields in logs and hold snapshots; raw PATH, probe output, hook output, argv, and credentials are
   absent
+- GitHub capability failures preserve their stable code plus an optional stderr-only diagnostic
+  excerpt capped at 2048 UTF-8 bytes after normalization and credential redaction; stdout, raw
+  executor fields, tokens, and authorization material are absent
 - Logging sink failures do not crash orchestration
 - Token/rate-limit aggregation remains correct across repeated agent updates
 - If a human-readable status surface is implemented, it is driven from orchestrator state and does

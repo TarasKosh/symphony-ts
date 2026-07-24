@@ -2,7 +2,6 @@ import { join, resolve } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { GithubCapabilityError } from "../../src/agent/github-capability.js";
 import {
   type AgentRunResult,
   AgentRunner,
@@ -286,7 +285,7 @@ describe("OrchestratorRuntimeHost", () => {
     );
   });
 
-  it("surfaces a deterministic GitHub capability failure and schedules no automatic retry", async () => {
+  it("surfaces a sanitized missing-remote diagnostic on a timer-free operator hold", async () => {
     const tracker = createTracker();
     const config = createConfig();
     config.capabilities.github.required = true;
@@ -304,28 +303,43 @@ describe("OrchestratorRuntimeHost", () => {
       }),
     };
     const startSession = vi.fn();
-    const createCodexClient = vi.fn(() => ({
-      execCommand: vi.fn(),
-      configureDynamicTools: vi.fn(),
-      startSession,
-      continueTurn: vi.fn(),
-      close: vi.fn().mockResolvedValue(undefined),
-    }));
+    const sanitizedDiagnostic =
+      "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use `gh auth login` [REDACTED]";
+    const message = `Required GitHub capability failed: ticket workspace '1' has no GitHub-backed git remote. GitHub CLI diagnostic: ${sanitizedDiagnostic}`;
+    const rawToken = ["ghp_", "a".repeat(36)].join("");
+    const rawStdout = `stdout-only poison: HTTP 401; gh auth login; ${rawToken}`;
+    const rawStderr = `none of the git remotes configured for this repository point to a known GitHub host.
+To tell gh about a new GitHub host, please use \`gh auth login\`
+GH_TOKEN=${rawToken}`;
+    const createCodexClient = vi.fn(() => {
+      const execCommand = vi
+        .fn()
+        .mockResolvedValueOnce({
+          exitCode: 0,
+          stdout: "octocat\n",
+          stderr: "",
+        })
+        .mockResolvedValueOnce({
+          exitCode: 1,
+          stdout: rawStdout,
+          stderr: rawStderr,
+          stack: `raw stack ${rawToken}`,
+          errorPath: "C:\\private\\tools\\gh.exe",
+          errorSyscall: "spawn gh.exe",
+        });
+      return {
+        execCommand,
+        configureDynamicTools: vi.fn(),
+        startSession,
+        continueTurn: vi.fn(),
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+    });
     const runner = new AgentRunner({
       config,
       tracker,
       workspaceManager: workspaceManager as never,
       hooks: hooks as never,
-      githubCapabilityProbe: {
-        probe: vi.fn().mockRejectedValue(
-          new GithubCapabilityError({
-            code: ERROR_CODES.githubAuthInvalid,
-            message:
-              "Required GitHub capability failed: gh authentication is invalid or expired.",
-            deterministic: true,
-          }),
-        ),
-      },
       createCodexClient,
     });
     const entries: StructuredLogEntry[] = [];
@@ -353,18 +367,39 @@ describe("OrchestratorRuntimeHost", () => {
     expect(createCodexClient).toHaveBeenCalledTimes(1);
     expect(startSession).not.toHaveBeenCalled();
     expect(host.getState().operatorHolds["1"]).toMatchObject({
-      error: expect.stringContaining(ERROR_CODES.githubAuthInvalid),
+      error: expect.stringContaining(ERROR_CODES.githubRemoteMissing),
     });
+    expect(host.getState().operatorHolds["1"]?.error).toContain(
+      sanitizedDiagnostic,
+    );
     expect(host.getState().retryAttempts["1"]).toBeUndefined();
     expect(entries).toContainEqual(
       expect.objectContaining({
         event: "worker_exit_abnormal",
-        error_code: ERROR_CODES.githubAuthInvalid,
+        error_code: ERROR_CODES.githubRemoteMissing,
         capability: "github",
-        reason:
-          "Required GitHub capability failed: gh authentication is invalid or expired.",
+        reason: message,
       }),
     );
+    const snapshot = await host.getRuntimeSnapshot();
+    const details = await host.getIssueDetails("ISSUE-1");
+    const operatorSurfaces = JSON.stringify({
+      entries,
+      hold: host.getState().operatorHolds["1"],
+      snapshot,
+      details,
+    });
+    expect(operatorSurfaces).toContain(sanitizedDiagnostic);
+    expect(operatorSurfaces).not.toContain(rawStdout);
+    expect(operatorSurfaces).not.toContain(rawToken);
+    expect(operatorSurfaces).not.toContain("Authorization");
+    expect(operatorSurfaces).not.toContain("raw stack");
+    expect(operatorSurfaces).not.toContain("C:\\private\\tools\\gh.exe");
+    expect(operatorSurfaces).not.toContain('"stdout"');
+    expect(operatorSurfaces).not.toContain('"stderr"');
+    expect(operatorSurfaces).not.toContain('"stack"');
+    expect(operatorSurfaces).not.toContain('"errorPath"');
+    expect(operatorSurfaces).not.toContain('"errorSyscall"');
 
     await host.pollOnce();
     await host.waitForIdle();
@@ -381,7 +416,7 @@ describe("OrchestratorRuntimeHost", () => {
     expect(createCodexClient).toHaveBeenCalledTimes(2);
     expect(startSession).not.toHaveBeenCalled();
     expect(host.getState().operatorHolds["1"]).toMatchObject({
-      error: expect.stringContaining(ERROR_CODES.githubAuthInvalid),
+      error: expect.stringContaining(ERROR_CODES.githubRemoteMissing),
     });
     expect(host.getState().retryAttempts["1"]).toBeUndefined();
   });
