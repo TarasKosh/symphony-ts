@@ -64,3 +64,22 @@ Use `IMPLEMENTATION_PLAN.md` as the required development sequence: contributors 
 Tasks 1 and 2 may be developed directly in the main working copy. For every task after Task 2, create a dedicated worktree under `.worktrees/` and do the implementation on a separate branch. Complete the work there, push the branch, and open a pull request before merging. Example flow: `git worktree add .worktrees/task-3 -b task-3`, implement the change in that worktree, then submit a PR for review.
 
 After finishing any task, verify that the implementation matches `SPEC.upstream.md` without behavioral or scope drift. Once that check passes, open the pull request immediately rather than batching multiple tasks into one PR.
+
+## Remotes & Fork Topology
+
+This local checkout uses a two-remote fork workflow. Do not rename these remotes without updating this section and the worktree upstreams.
+
+| Remote name | URL | Role |
+|---|---|---|
+| `origin` | `https://github.com/Chetvertkov/symphony-ts.git` | Upstream / main repository. `git pull` on `main` fetches from here. |
+| `fork` | `https://github.com/TarasKosh/symphony-ts.git` | Personal fork. Feature branches are pushed here, then a PR is opened into `origin`. |
+
+Note the naming: the remote literally named `fork` is the personal fork (`TarasKosh/symphony-ts`), not the upstream. The local `main` branch tracks `origin/main` (Chetvertkov), so a plain `git pull` always pulls the upstream.
+
+Contribution flow used for the merged PRs (#5–#7):
+
+1. Create a task branch in a worktree under `.worktrees/` (see Branching & Worktree Workflow above).
+2. Push the branch to `fork` (`TarasKosh/symphony-ts`).
+3. Open a pull request from `fork` into `origin` (`Chetvertkov/symphony-ts`) and merge there.
+
+Feature-branch worktrees under `.worktrees/` track their `fork/*` counterparts, while `main` in the primary working copy tracks `origin/main`. To sync the upstream: `git pull --ff-only origin main`.
