@@ -1,0 +1,5 @@
+# Keep Windows checkouts compatible with Biome's LF formatting.
+* text=auto eol=lf
+
+# Never apply text conversion to the tracked binary asset.
+.github/media/demo.png binary
