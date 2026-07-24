@@ -54,13 +54,30 @@ describe("runtime snapshot", () => {
       dueAtMs: Date.parse("2026-03-06T10:00:20.000Z"),
       timerHandle: null,
       error: "no available orchestrator slots",
+      capabilityFailure: {
+        code: "required_command_capability_transient",
+        capability: "external_command",
+        command: "rg",
+        boundary: "agent",
+        remediation:
+          "Retry the issue after the command execution environment is available.",
+      },
     };
     state.operatorHolds["issue-4"] = {
       issueId: "issue-4",
       identifier: "HOLD-4",
       attempt: 3,
       heldAtMs: Date.parse("2026-03-06T10:00:07.000Z"),
-      error: "github_auth_invalid: authentication failed",
+      error:
+        "required_command_not_found: required command rg is unavailable at agent",
+      capabilityFailure: {
+        code: "required_command_not_found",
+        capability: "external_command",
+        command: "rg",
+        boundary: "agent",
+        remediation:
+          "Install rg in the agent execution environment, then explicitly retry the held issue.",
+      },
     };
 
     const snapshot = buildRuntimeSnapshot(state, {
@@ -100,6 +117,14 @@ describe("runtime snapshot", () => {
         attempt: 2,
         due_at: "2026-03-06T10:00:20.000Z",
         error: "no available orchestrator slots",
+        capability_failure: {
+          code: "required_command_capability_transient",
+          capability: "external_command",
+          command: "rg",
+          boundary: "agent",
+          remediation:
+            "Retry the issue after the command execution environment is available.",
+        },
       },
     ]);
     expect(snapshot.holds).toEqual([
@@ -108,7 +133,16 @@ describe("runtime snapshot", () => {
         issue_identifier: "HOLD-4",
         attempt: 3,
         held_at: "2026-03-06T10:00:07.000Z",
-        error: "github_auth_invalid: authentication failed",
+        error:
+          "required_command_not_found: required command rg is unavailable at agent",
+        capability_failure: {
+          code: "required_command_not_found",
+          capability: "external_command",
+          command: "rg",
+          boundary: "agent",
+          remediation:
+            "Install rg in the agent execution environment, then explicitly retry the held issue.",
+        },
       },
     ]);
     expect(snapshot.codex_totals).toEqual({

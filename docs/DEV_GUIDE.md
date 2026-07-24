@@ -225,6 +225,10 @@ results when ready for review.
 | `codex.turn_timeout_ms` | Max wall-clock time in ms for a full agent turn | `3600000` |
 | `codex.read_timeout_ms` | Max response wait for synchronous Codex requests; Windows session-start requests use at least `30000` ms | `5000` |
 | `codex.stall_timeout_ms` | Max silent time in ms before a running agent is declared stalled and stopped | `300000` |
+| `capabilities.commands` | Map of safe executable basenames to hook/agent boundary requirements | `{}` |
+| `capabilities.commands.<command>.hooks` | Required hook boundaries (`after_create`, `before_run`, `after_run`, `before_remove`) | `[]` |
+| `capabilities.commands.<command>.agent` | Probe through the worker Codex app-server before tracker claim and turn start | `false` |
+| `capabilities.commands.<command>.probe_args` | Direct argv used only for the agent probe | `[]` |
 | `capabilities.github.required` | Require a read-only `gh` identity, target-repository, and push-permission preflight before Codex starts | `false` |
 | `capabilities.github.credential_source` | Use inherited env credentials, or bridge the current `gh auth` token into Codex memory-only | `environment` |
 | `server.port` | HTTP dashboard port; omit or `null` to disable | `null` |
@@ -297,6 +301,33 @@ With that in place, env-based credentials exported before launching Symphony are
 commands. If a specific external CLI still does not find usable credentials or executable paths in
 your environment, provide that tool's credential via an env var such as `GH_TOKEN`, `GITHUB_TOKEN`,
 or a provider-specific API key and launch `codex.command` with an explicit `PATH=...` prefix.
+
+For a workflow that requires an external command, declare every real execution boundary:
+
+```yaml
+capabilities:
+  commands:
+    rg:
+      hooks: [after_create, before_run]
+      agent: true
+      probe_args: [--version]
+```
+
+Command keys are simple executable basenames; paths, whitespace, shell metacharacters, and inactive
+declarations are `config_invalid`. Omitting the map is a true no-op. Hook checks run before the hook
+body in the same `sh -lc` invocation and do not invoke the required command. Agent checks use a
+direct argv vector through the same app-server instance, workspace cwd, inherited environment, and
+prepared turn sandbox as the later Codex session. Success in one boundary does not prove the other.
+
+Missing and execution-denied commands enter a timer-free operator hold. Repair the command's PATH,
+installation, execute permission, or sandbox policy in the named boundary, then use the dashboard's
+explicit retry action. Timeout, protocol, and unclassified checks use ordinary retry backoff. The
+operator surfaces retain only sanitized command, boundary, capability, stable code, and remediation
+metadata; raw PATH, probe output, arguments, and credentials are discarded.
+
+Symphony does not auto-inject Codex's bundled ripgrep. `codex.command` can name an arbitrary wrapper
+or compatible app-server, bundled installation paths are private and unstable, and injecting PATH
+would alter command precedence while still saying nothing about the hook shell boundary.
 
 For workflows that must push through GitHub CLI, enable the opt-in preflight:
 
@@ -441,6 +472,13 @@ These fields take effect on the next poll tick without restarting Symphony:
   environment is only available to a new process. The `gh_auth_token` source is re-read on the
   selected issue's retry, so a completed `gh auth login` does not require a Symphony restart.
   Transient/network failures retry automatically with normal failure backoff.
+
+**Required command capability is on operator hold**
+
+- Read the structured `command`, `boundary`, and `remediation` fields; raw PATH and probe output are
+  intentionally unavailable.
+- Install or expose the executable in the named boundary, or repair its execute/sandbox policy.
+- Explicitly retry only the held issue after the boundary is repaired.
 
 **Agent stalls and never finishes**
 - `codex.stall_timeout_ms` (default 5 minutes) will kill and retry a stalled agent

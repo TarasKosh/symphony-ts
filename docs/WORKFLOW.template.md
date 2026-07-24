@@ -109,6 +109,21 @@ hooks:
 # capabilities — Required external CLI access (all opt-in)
 # ============================================================
 capabilities:
+  # External commands required by this workflow. Keys must be simple executable
+  # basenames: no whitespace, path separators, or shell metacharacters.
+  # Omit this map (or leave it empty) for no added startup behavior.
+  # Example (replace the empty map below):
+  #   commands:
+  #     rg:
+  #       hooks: [after_create, before_run]
+  #       agent: true
+  #       probe_args: [--version]
+  # Hook checks run immediately before the hook body in the same sh -lc
+  # invocation. Agent checks run through the same app-server, cwd,
+  # environment, and prepared sandbox as the later turn.
+  # Defaults: hooks [], agent false, probe_args []
+  commands: {}
+
   github:
     # Before the first Codex turn, verify gh identity and push access to the
     # repository checked out in the ticket workspace. The probe is read-only.
@@ -269,6 +284,19 @@ With `credential_source: gh_auth_token`, Symphony keeps the GitHub CLI token in 
 re-reads it for a new worker or explicit retry. Non-empty `GH_TOKEN` and `GITHUB_TOKEN` values always
 take priority. Codex and its agent commands can access the selected credential, so enable this only
 for trusted workflows.
+
+Declared `capabilities.commands` are boundary-scoped. Hook requirements are checked without
+invoking the command, inside the hook's own `sh -lc`; agent requirements execute the declared
+basename plus `probe_args` through Codex `command/exec`. A command listed for both boundaries must
+pass both. Missing and execution-denied commands create a timer-free operator hold; timeout,
+protocol, and unclassified failures use retry backoff. Diagnostics contain only the command,
+boundary, stable code, capability name, and remediation—never PATH, resolved paths, probe output,
+arguments, or credentials.
+
+Symphony deliberately does not inject a private Codex-bundled `rg`. Codex may be launched through
+an arbitrary compatible wrapper, bundled paths are not a stable API, and PATH injection would alter
+command precedence without proving availability in the hook shell. Install the command in each
+declared boundary, then explicitly retry the held issue.
 
 When finished:
 

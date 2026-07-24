@@ -1,7 +1,9 @@
 import {
-  isDeterministicGithubCapabilityErrorCode,
-  isGithubCapabilityErrorCode,
-} from "../agent/github-capability.js";
+  type CapabilityFailureMetadata,
+  isCapabilityErrorCode,
+  isDeterministicCapabilityErrorCode,
+  requiresPredispatchCapability,
+} from "../capabilities/external-command.js";
 import type { CodexClientEvent } from "../codex/app-server-client.js";
 import { validateDispatchConfig } from "../config/config-resolver.js";
 import type {
@@ -104,6 +106,10 @@ export interface OrchestratorCoreOptions {
     cleanupWorkspace: boolean;
     reason: StopReason;
   }) => Promise<void> | void;
+  cleanupHeldIssue?: (input: {
+    issueId: string;
+    issueIdentifier: string | null;
+  }) => Promise<void> | void;
   timerScheduler?: TimerScheduler;
   now?: () => Date;
 }
@@ -117,6 +123,8 @@ export class OrchestratorCore {
 
   private readonly stopRunningIssue?: OrchestratorCoreOptions["stopRunningIssue"];
 
+  private readonly cleanupHeldIssue?: OrchestratorCoreOptions["cleanupHeldIssue"];
+
   private readonly timerScheduler: TimerScheduler;
 
   private readonly now: () => Date;
@@ -128,6 +136,7 @@ export class OrchestratorCore {
     this.tracker = options.tracker;
     this.spawnWorker = options.spawnWorker;
     this.stopRunningIssue = options.stopRunningIssue;
+    this.cleanupHeldIssue = options.cleanupHeldIssue;
     this.timerScheduler = options.timerScheduler ?? defaultTimerScheduler();
     this.now = options.now ?? (() => new Date());
     this.state = createInitialOrchestratorState({
@@ -274,6 +283,20 @@ export class OrchestratorCore {
     }
 
     this.clearRetryEntry(issueId);
+    if (!validateDispatchConfig(this.config).ok) {
+      return {
+        dispatched: false,
+        released: false,
+        retryEntry: this.scheduleRetry(issueId, retryEntry.attempt + 1, {
+          identifier: retryEntry.identifier,
+          error: `${ERROR_CODES.configInvalid}: dispatch configuration is invalid`,
+          delayType: "failure",
+          ...(retryEntry.capabilityFailure === undefined
+            ? {}
+            : { capabilityFailure: retryEntry.capabilityFailure }),
+        }),
+      };
+    }
 
     let candidates: Issue[];
     try {
@@ -286,6 +309,9 @@ export class OrchestratorCore {
           identifier: retryEntry.identifier,
           error: "retry poll failed",
           delayType: "failure",
+          ...(retryEntry.capabilityFailure === undefined
+            ? {}
+            : { capabilityFailure: retryEntry.capabilityFailure }),
         }),
       };
     }
@@ -321,6 +347,9 @@ export class OrchestratorCore {
           identifier: issue.identifier,
           error: "no available orchestrator slots",
           delayType: "failure",
+          ...(retryEntry.capabilityFailure === undefined
+            ? {}
+            : { capabilityFailure: retryEntry.capabilityFailure }),
         }),
       };
     }
@@ -341,12 +370,23 @@ export class OrchestratorCore {
     if (hold === undefined) {
       return { dispatched: false, released: false, hold: null };
     }
+    if (!validateDispatchConfig(this.config).ok) {
+      return { dispatched: false, released: false, hold };
+    }
 
     let candidates: Issue[];
     try {
       candidates = await this.tracker.fetchCandidateIssues();
     } catch {
       return { dispatched: false, released: false, hold };
+    }
+
+    if (this.state.operatorHolds[issueId] !== hold) {
+      return {
+        dispatched: false,
+        released: false,
+        hold: this.state.operatorHolds[issueId] ?? null,
+      };
     }
 
     const issue = candidates.find((candidate) => candidate.id === issueId);
@@ -380,6 +420,7 @@ export class OrchestratorCore {
     handoff?: TrackerHandoffRunResult | null;
     blocker?: TrackerBlockerRunResult | null;
     progressSignature?: string | null;
+    capabilityFailure?: CapabilityFailureMetadata;
   }): RetryEntry | OperatorHoldEntry | null {
     const runningEntry = this.state.running[input.issueId];
     if (runningEntry === undefined) {
@@ -443,12 +484,21 @@ export class OrchestratorCore {
       });
     }
 
-    const errorCode = input.errorCode;
-    if (isDeterministicGithubCapabilityErrorCode(errorCode)) {
+    const errorCode = input.capabilityFailure?.code ?? input.errorCode;
+    if (isDeterministicCapabilityErrorCode(errorCode)) {
       return this.holdForOperatorAction(input.issueId, {
         attempt: nextRetryAttempt(runningEntry.retryAttempt),
         identifier: runningEntry.identifier,
-        error: formatCapabilityFailure(errorCode, input.reason),
+        error:
+          input.capabilityFailure === undefined
+            ? formatCapabilityFailure(
+                errorCode ?? ERROR_CODES.requiredCommandCapabilityTransient,
+                input.reason,
+              )
+            : formatStructuredCapabilityFailure(input.capabilityFailure),
+        ...(input.capabilityFailure === undefined
+          ? {}
+          : { capabilityFailure: input.capabilityFailure }),
       });
     }
 
@@ -457,10 +507,18 @@ export class OrchestratorCore {
       nextRetryAttempt(runningEntry.retryAttempt),
       {
         identifier: runningEntry.identifier,
-        error: isGithubCapabilityErrorCode(errorCode)
-          ? formatCapabilityFailure(errorCode, input.reason)
+        error: isCapabilityErrorCode(errorCode)
+          ? input.capabilityFailure === undefined
+            ? formatCapabilityFailure(
+                errorCode ?? ERROR_CODES.requiredCommandCapabilityTransient,
+                input.reason,
+              )
+            : formatStructuredCapabilityFailure(input.capabilityFailure)
           : formatWorkerExitReason(input.reason),
         delayType: "failure",
+        ...(input.capabilityFailure === undefined
+          ? {}
+          : { capabilityFailure: input.capabilityFailure }),
       },
     );
   }
@@ -543,7 +601,11 @@ export class OrchestratorCore {
     lifecycleWriteBlocker: TrackerLifecycleBlocker | null;
   }> {
     let issueForDispatch = issue;
-    if (!this.config.capabilities.github.required) {
+    if (
+      !requiresPredispatchCapability(this.config) &&
+      this.config.tracker.requireClaimBeforeAgent &&
+      supportsTrackerLifecycleWrite(this.tracker)
+    ) {
       try {
         issueForDispatch = await this.claimIssueBeforeDispatch(issue);
       } catch (error) {
@@ -565,27 +627,35 @@ export class OrchestratorCore {
       }
     }
 
+    const reservation: RunningEntry = {
+      ...createEmptyLiveSession(),
+      issue: issueForDispatch,
+      identifier: issueForDispatch.identifier,
+      retryAttempt: normalizeRetryAttempt(attempt),
+      startedAt: this.now().toISOString(),
+      workerHandle: null,
+      monitorHandle: null,
+    };
+    this.state.running[issueForDispatch.id] = reservation;
+    this.state.claimed.add(issueForDispatch.id);
+    this.clearRetryEntry(issueForDispatch.id);
+
     try {
       const spawned = await this.spawnWorker({
         issue: issueForDispatch,
         attempt,
       });
-      this.state.running[issueForDispatch.id] = {
-        ...createEmptyLiveSession(),
-        issue: issueForDispatch,
-        identifier: issueForDispatch.identifier,
-        retryAttempt: normalizeRetryAttempt(attempt),
-        startedAt: this.now().toISOString(),
-        workerHandle: spawned.workerHandle,
-        monitorHandle: spawned.monitorHandle,
-      };
-      this.state.claimed.add(issueForDispatch.id);
-      this.clearRetryEntry(issueForDispatch.id);
+      reservation.workerHandle = spawned.workerHandle;
+      reservation.monitorHandle = spawned.monitorHandle;
       return {
         dispatched: true,
         lifecycleWriteBlocker: null,
       };
     } catch {
+      if (this.state.running[issueForDispatch.id] === reservation) {
+        delete this.state.running[issueForDispatch.id];
+      }
+      this.state.claimed.delete(issueForDispatch.id);
       this.scheduleRetry(issueForDispatch.id, nextRetryAttempt(attempt), {
         identifier: issueForDispatch.identifier,
         error: "failed to spawn agent",
@@ -636,7 +706,9 @@ export class OrchestratorCore {
   }> {
     const stopRequests = await this.reconcileStalledRuns();
     const runningIds = Object.keys(this.state.running);
-    if (runningIds.length === 0) {
+    const heldIds = Object.keys(this.state.operatorHolds);
+    const reconciledIds = [...new Set([...runningIds, ...heldIds])];
+    if (reconciledIds.length === 0) {
       return {
         stopRequests,
         reconciliationFetchFailed: false,
@@ -645,7 +717,7 @@ export class OrchestratorCore {
 
     let refreshed: IssueStateSnapshot[];
     try {
-      refreshed = await this.tracker.fetchIssueStatesByIds(runningIds);
+      refreshed = await this.tracker.fetchIssueStatesByIds(reconciledIds);
     } catch {
       return {
         stopRequests,
@@ -661,11 +733,38 @@ export class OrchestratorCore {
 
     for (const snapshot of refreshed) {
       const runningEntry = this.state.running[snapshot.id];
-      if (runningEntry === undefined) {
+      const hold = this.state.operatorHolds[snapshot.id];
+      if (runningEntry === undefined && hold === undefined) {
         continue;
       }
 
       const normalizedState = normalizeIssueState(snapshot.state);
+      if (hold !== undefined) {
+        if (terminalStates.has(normalizedState)) {
+          try {
+            await this.cleanupHeldIssue?.({
+              issueId: snapshot.id,
+              issueIdentifier: hold.identifier,
+            });
+          } finally {
+            this.releaseClaim(snapshot.id);
+          }
+          continue;
+        }
+
+        if (activeStates.has(normalizedState)) {
+          hold.identifier = snapshot.identifier;
+          continue;
+        }
+
+        this.releaseClaim(snapshot.id);
+        continue;
+      }
+
+      if (runningEntry === undefined) {
+        continue;
+      }
+
       if (terminalStates.has(normalizedState)) {
         stopRequests.push(
           await this.requestStop(runningEntry, true, "terminal_state"),
@@ -701,6 +800,14 @@ export class OrchestratorCore {
       stopRequests.push(
         await this.requestStop(runningEntry, false, "inactive_state"),
       );
+    }
+
+    for (const heldId of heldIds) {
+      if (refreshedIds.has(heldId)) {
+        continue;
+      }
+
+      this.releaseClaim(heldId);
     }
 
     return {
@@ -764,6 +871,7 @@ export class OrchestratorCore {
       identifier: string | null;
       error: string | null;
       delayType: "continuation" | "failure";
+      capabilityFailure?: CapabilityFailureMetadata;
     },
   ): RetryEntry {
     this.clearRetryEntry(issueId);
@@ -787,6 +895,9 @@ export class OrchestratorCore {
       dueAtMs,
       timerHandle,
       error: input.error,
+      ...(input.capabilityFailure === undefined
+        ? {}
+        : { capabilityFailure: input.capabilityFailure }),
     };
 
     this.state.claimed.add(issueId);
@@ -800,6 +911,7 @@ export class OrchestratorCore {
       attempt: number;
       identifier: string | null;
       error: string;
+      capabilityFailure?: CapabilityFailureMetadata;
     },
   ): OperatorHoldEntry {
     this.clearRetryEntry(issueId);
@@ -810,6 +922,9 @@ export class OrchestratorCore {
       attempt: input.attempt,
       heldAtMs: this.now().getTime(),
       error: input.error,
+      ...(input.capabilityFailure === undefined
+        ? {}
+        : { capabilityFailure: input.capabilityFailure }),
     };
 
     this.state.claimed.add(issueId);
@@ -881,6 +996,12 @@ function formatCapabilityFailure(
   reason: string | undefined,
 ): string {
   return `${errorCode}: ${formatWorkerExitReason(reason)}`;
+}
+
+function formatStructuredCapabilityFailure(
+  failure: CapabilityFailureMetadata,
+): string {
+  return `${failure.code}: ${failure.capability} command '${failure.command}' failed in ${failure.boundary}. ${failure.remediation}`;
 }
 
 function buildNoProgressSignature(runningEntry: RunningEntry): string {

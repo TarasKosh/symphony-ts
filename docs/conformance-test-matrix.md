@@ -9,10 +9,14 @@ current automated test suite in this repository.
 - `tests/config/config-resolver.test.ts`
 - `tests/config/workflow-watch.test.ts`
 - `tests/agent/prompt-builder.test.ts`
+- `tests/capabilities/external-command.test.ts`
 
 Covered behaviors include workflow path precedence, missing and invalid
 workflow errors, defaults, `$VAR` resolution, `~` expansion, strict prompt
 rendering, and last-known-good reload behavior.
+External-command coverage adds safe basename and closed-schema validation,
+boundary descriptors, Windows executable/timeout behavior, and sanitized
+deterministic/transient classification.
 
 ## 17.2 Workspace Manager and Safety
 
@@ -24,6 +28,9 @@ rendering, and last-known-good reload behavior.
 Covered behaviors include deterministic workspace paths, create/reuse rules,
 safe rejection of invalid paths, hook lifecycle behavior, workspace cwd
 validation, and cleanup of temporary workspace artifacts before each run.
+Boundary preflight coverage proves same-invocation hook ordering, marker
+ownership, launch-versus-timeout classification, byte-for-byte no-op scripts,
+and newly-created empty-workspace recovery.
 
 ## 17.3 Issue Tracker Client
 
@@ -52,6 +59,9 @@ reconciliation, stop and cleanup rules, continuation and failure retry
 behavior, lifecycle claim blocking before worker spawn, structured handoff
 continuation suppression, no-progress holds, backoff capping, stall handling,
 slot exhaustion, and runtime snapshot contents.
+It also covers command capability holds and backoff, preflight claim deferral,
+explicit retry isolation, concurrent-dispatch reservation, held-issue
+reconciliation, and sanitized hold metadata.
 
 ## 17.5 Coding-Agent App-Server Client
 
@@ -64,6 +74,9 @@ policy payloads, read and turn timeouts, stdout buffering, stderr handling,
 approval and user-input flows, usage and rate-limit extraction, unsupported
 tool handling, structured `symphony_handoff`, and the optional
 `linear_graphql` dynamic tool extension.
+Agent-boundary tests execute probes through the same fake app-server instance
+and assert that failures close the server before `thread/start` or
+`turn/start`.
 
 ## 17.6 Observability
 
@@ -88,6 +101,9 @@ Covered behaviors include positional workflow path handling, default
 `./WORKFLOW.md` loading, missing-path failures, startup failure surfacing,
 normal shutdown success, abnormal exit handling, `--port` wiring, and refresh
 driven host lifecycle behavior.
+The runtime integration suite also covers an opt-in missing hook command from
+workflow parsing through operator hold, structured diagnostics, and an
+unexecuted hook body.
 
 ## Validation Command
 

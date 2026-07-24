@@ -28,6 +28,7 @@ export interface RuntimeSnapshotRetryRow {
   attempt: number;
   due_at: string;
   error: string | null;
+  capability_failure?: RuntimeSnapshotCapabilityFailure;
 }
 
 export interface RuntimeSnapshotHoldRow {
@@ -36,6 +37,15 @@ export interface RuntimeSnapshotHoldRow {
   attempt: number;
   held_at: string;
   error: string;
+  capability_failure?: RuntimeSnapshotCapabilityFailure;
+}
+
+export interface RuntimeSnapshotCapabilityFailure {
+  code: string;
+  capability: string;
+  command: string;
+  boundary: string;
+  remediation: string;
 }
 
 export interface RuntimeSnapshot {
@@ -96,6 +106,9 @@ export function buildRuntimeSnapshot(
       attempt: entry.attempt,
       due_at: new Date(entry.dueAtMs).toISOString(),
       error: entry.error,
+      ...(entry.capabilityFailure === undefined
+        ? {}
+        : { capability_failure: { ...entry.capabilityFailure } }),
     }));
 
   const holds = Object.values(state.operatorHolds)
@@ -107,6 +120,9 @@ export function buildRuntimeSnapshot(
       attempt: entry.attempt,
       held_at: new Date(entry.heldAtMs).toISOString(),
       error: entry.error,
+      ...(entry.capabilityFailure === undefined
+        ? {}
+        : { capability_failure: { ...entry.capabilityFailure } }),
     }));
 
   return {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ResolvedWorkflowConfig } from "../../src/config/types.js";
 import type { Issue } from "../../src/domain/model.js";
@@ -500,6 +500,621 @@ describe("orchestrator core", () => {
     ]);
   });
 
+  it.each([
+    ERROR_CODES.requiredCommandNotFound,
+    ERROR_CODES.requiredCommandExecutionDenied,
+  ])(
+    "places deterministic external-command failure %s on a timer-free operator hold",
+    async (code) => {
+      const timers = createFakeTimerScheduler();
+      const orchestrator = createOrchestrator({ timerScheduler: timers });
+      const capabilityFailure = createCommandCapabilityFailure(code);
+
+      await orchestrator.pollTick();
+      const hold = orchestrator.onWorkerExit({
+        issueId: "1",
+        outcome: "abnormal",
+        reason: `${code}: required command rg is unavailable at agent`,
+        capabilityFailure,
+      });
+
+      expect(hold).toMatchObject({
+        issueId: "1",
+        identifier: "ISSUE-1",
+        attempt: 1,
+        capabilityFailure,
+      });
+      expect(orchestrator.getState().operatorHolds["1"]).toEqual(hold);
+      expect(orchestrator.getState().retryAttempts["1"]).toBeUndefined();
+      expect(timers.scheduled).toEqual([]);
+    },
+  );
+
+  it("uses normal failure backoff and retains sanitized metadata for transient command checks", async () => {
+    const timers = createFakeTimerScheduler();
+    const orchestrator = createOrchestrator({ timerScheduler: timers });
+    const capabilityFailure = createCommandCapabilityFailure(
+      ERROR_CODES.requiredCommandCapabilityTransient,
+    );
+
+    await orchestrator.pollTick();
+    const retry = orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason:
+        "required_command_capability_transient: command availability could not be verified",
+      capabilityFailure,
+    });
+
+    expect(retry).toMatchObject({
+      issueId: "1",
+      attempt: 1,
+      capabilityFailure,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBeUndefined();
+    expect(orchestrator.getState().retryAttempts["1"]).toEqual(retry);
+    expect(timers.scheduled).toEqual([
+      expect.objectContaining({ delayMs: 10_000 }),
+    ]);
+  });
+
+  it("suppresses polling for held command failures and retries only the selected hold", async () => {
+    const timers = createFakeTimerScheduler();
+    const issues = [
+      createIssue({ id: "1", identifier: "ISSUE-1" }),
+      createIssue({ id: "2", identifier: "ISSUE-2" }),
+    ];
+    const orchestrator = createOrchestrator({
+      timerScheduler: timers,
+      tracker: createTracker({
+        candidates: issues,
+        statesById: issues.map((issue) => ({
+          id: issue.id,
+          identifier: issue.identifier,
+          state: "In Progress",
+        })),
+      }),
+      config: createConfig({
+        commands: {
+          rg: {
+            hooks: [],
+            agent: true,
+            probeArgs: ["--version"],
+          },
+        },
+      }),
+    });
+
+    await orchestrator.pollTick();
+    for (const issue of issues) {
+      orchestrator.onWorkerExit({
+        issueId: issue.id,
+        outcome: "abnormal",
+        reason: "required command unavailable",
+        capabilityFailure: createCommandCapabilityFailure(
+          ERROR_CODES.requiredCommandNotFound,
+        ),
+      });
+    }
+
+    const holdTwo = orchestrator.getState().operatorHolds["2"];
+    const unchangedPoll = await orchestrator.pollTick();
+    expect(unchangedPoll.dispatchedIssueIds).toEqual([]);
+    expect(Object.keys(orchestrator.getState().running)).toEqual([]);
+
+    await expect(orchestrator.retryOperatorHold("1")).resolves.toEqual({
+      dispatched: true,
+      released: false,
+      hold: null,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBeUndefined();
+    expect(orchestrator.getState().operatorHolds["2"]).toEqual(holdTwo);
+    expect(Object.keys(orchestrator.getState().running)).toEqual(["1"]);
+    expect(timers.scheduled).toEqual([]);
+  });
+
+  it.each([
+    ["afterCreate", { hooks: ["afterCreate"], agent: false }],
+    ["beforeRun", { hooks: ["beforeRun"], agent: false }],
+    ["agent", { hooks: [], agent: true }],
+  ] as const)(
+    "defers tracker claim until the worker for the %s command boundary",
+    async (_boundary, requirement) => {
+      const claimIssue = vi.fn(async ({ issue }: { issue: Issue }) => ({
+        issue: { id: issue.id, identifier: issue.identifier, state: "Claimed" },
+        state: "Claimed",
+      }));
+      const tracker: IssueTracker = {
+        ...createTracker({
+          candidates: [
+            createIssue({ id: "1", identifier: "ISSUE-1", state: "Todo" }),
+          ],
+        }),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      };
+      const spawnedStates: string[] = [];
+      const orchestrator = createOrchestrator({
+        tracker,
+        config: createConfig({
+          commands: {
+            rg: {
+              ...requirement,
+              probeArgs: ["--version"],
+            },
+          },
+        }),
+        spawnWorker: async ({ issue }) => {
+          spawnedStates.push(issue.state);
+          return {
+            workerHandle: { pid: 1001 },
+            monitorHandle: { ref: "monitor-1" },
+          };
+        },
+      });
+
+      await orchestrator.pollTick();
+
+      expect(claimIssue).not.toHaveBeenCalled();
+      expect(spawnedStates).toEqual(["Todo"]);
+    },
+  );
+
+  it("does not defer tracker claim for late best-effort command boundaries", async () => {
+    const claimIssue = vi.fn(async ({ issue }: { issue: Issue }) => ({
+      issue: {
+        id: issue.id,
+        identifier: issue.identifier,
+        state: "In Progress",
+      },
+      state: "In Progress",
+    }));
+    const tracker: IssueTracker = {
+      ...createTracker({
+        candidates: [
+          createIssue({ id: "1", identifier: "ISSUE-1", state: "Todo" }),
+        ],
+      }),
+      claimIssue,
+      handoffIssue: vi.fn(),
+    };
+    const orchestrator = createOrchestrator({
+      tracker,
+      config: createConfig({
+        commands: {
+          rg: {
+            hooks: ["afterRun", "beforeRemove"],
+            agent: false,
+            probeArgs: ["--version"],
+          },
+        },
+      }),
+    });
+
+    await orchestrator.pollTick();
+
+    expect(claimIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves a local slot before asynchronous worker spawn completes", async () => {
+    const spawnStarted = createDeferred<void>();
+    const releaseSpawn = createDeferred<{
+      workerHandle: unknown;
+      monitorHandle: unknown;
+    }>();
+    const spawnWorker = vi.fn(async () => {
+      spawnStarted.resolve(undefined);
+      return await releaseSpawn.promise;
+    });
+    const orchestrator = createOrchestrator({
+      spawnWorker,
+      config: createConfig({
+        commands: {
+          rg: {
+            hooks: [],
+            agent: true,
+            probeArgs: ["--version"],
+          },
+        },
+      }),
+    });
+
+    const firstPoll = orchestrator.pollTick();
+    await spawnStarted.promise;
+    expect(orchestrator.getState().running["1"]).toBeDefined();
+
+    const secondPoll = await orchestrator.pollTick();
+    expect(secondPoll.dispatchedIssueIds).toEqual([]);
+    expect(spawnWorker).toHaveBeenCalledTimes(1);
+
+    releaseSpawn.resolve({
+      workerHandle: { pid: 1001 },
+      monitorHandle: { ref: "monitor-1" },
+    });
+    await firstPoll;
+    expect(orchestrator.getState().running["1"]?.workerHandle).toEqual({
+      pid: 1001,
+    });
+  });
+
+  it.each([
+    {
+      label: "terminal",
+      snapshots: [
+        { id: "1", identifier: "ISSUE-1", state: "Done" },
+      ] satisfies IssueStateSnapshot[],
+      cleanup: true,
+    },
+    {
+      label: "non-active",
+      snapshots: [
+        { id: "1", identifier: "ISSUE-1", state: "Backlog" },
+      ] satisfies IssueStateSnapshot[],
+      cleanup: false,
+    },
+    {
+      label: "missing",
+      snapshots: [] satisfies IssueStateSnapshot[],
+      cleanup: false,
+    },
+  ])(
+    "releases a held $label issue and applies terminal-only cleanup",
+    async ({ snapshots, cleanup }) => {
+      const trackerState = createMutableTracker();
+      const cleanupHeldIssue = vi.fn();
+      const orchestrator = createOrchestrator({
+        tracker: trackerState.tracker,
+        cleanupHeldIssue,
+      });
+
+      await orchestrator.pollTick();
+      orchestrator.onWorkerExit({
+        issueId: "1",
+        outcome: "abnormal",
+        reason: "required command unavailable",
+        capabilityFailure: createCommandCapabilityFailure(
+          ERROR_CODES.requiredCommandNotFound,
+        ),
+      });
+      trackerState.setCandidates([]);
+      trackerState.setSnapshots(snapshots);
+
+      await orchestrator.pollTick();
+
+      expect(orchestrator.getState().operatorHolds["1"]).toBeUndefined();
+      expect(orchestrator.getState().claimed.has("1")).toBe(false);
+      expect(cleanupHeldIssue).toHaveBeenCalledTimes(cleanup ? 1 : 0);
+      if (cleanup) {
+        expect(cleanupHeldIssue).toHaveBeenCalledWith({
+          issueId: "1",
+          issueIdentifier: "ISSUE-1",
+        });
+      }
+    },
+  );
+
+  it("keeps an active held issue claimed without redispatch or re-probing", async () => {
+    const trackerState = createMutableTracker();
+    const spawnWorker = vi.fn(async () => ({
+      workerHandle: { pid: 1001 },
+      monitorHandle: { ref: "monitor-1" },
+    }));
+    const orchestrator = createOrchestrator({
+      tracker: trackerState.tracker,
+      spawnWorker,
+    });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+    await orchestrator.pollTick();
+
+    expect(orchestrator.getState().operatorHolds["1"]).toBeDefined();
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+    expect(spawnWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a selected command hold when explicit retry cannot refresh candidates", async () => {
+    const holdTracker = createTracker();
+    const tracker: IssueTracker = {
+      ...holdTracker,
+      fetchCandidateIssues: vi
+        .fn()
+        .mockResolvedValueOnce([
+          createIssue({ id: "1", identifier: "ISSUE-1" }),
+        ])
+        .mockRejectedValueOnce(
+          new Error("tracker response included secret=do-not-log"),
+        ),
+    };
+    const orchestrator = createOrchestrator({ tracker });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+    const originalHold = orchestrator.getState().operatorHolds["1"];
+
+    await expect(orchestrator.retryOperatorHold("1")).resolves.toEqual({
+      dispatched: false,
+      released: false,
+      hold: originalHold,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBe(originalHold);
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+  });
+
+  it("preserves a selected hold when config becomes invalid before explicit retry", async () => {
+    const spawnWorker = vi.fn(async () => ({
+      workerHandle: { pid: 1001 },
+      monitorHandle: { ref: "monitor-1" },
+    }));
+    const orchestrator = createOrchestrator({ spawnWorker });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+    const originalHold = orchestrator.getState().operatorHolds["1"];
+    const invalidConfig = createConfig();
+    invalidConfig.codex.command = " ";
+    orchestrator.updateConfig(invalidConfig);
+
+    await expect(orchestrator.retryOperatorHold("1")).resolves.toEqual({
+      dispatched: false,
+      released: false,
+      hold: originalHold,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBe(originalHold);
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+    expect(spawnWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases only the selected hold when it becomes ineligible at retry time", async () => {
+    const first = createIssue({ id: "1", identifier: "ISSUE-1" });
+    const second = createIssue({ id: "2", identifier: "ISSUE-2" });
+    const trackerState = createMutableTracker({
+      candidates: [first, second],
+      snapshots: [
+        { id: "1", identifier: "ISSUE-1", state: "In Progress" },
+        { id: "2", identifier: "ISSUE-2", state: "In Progress" },
+      ],
+    });
+    const orchestrator = createOrchestrator({
+      tracker: trackerState.tracker,
+    });
+
+    await orchestrator.pollTick();
+    for (const issue of [first, second]) {
+      orchestrator.onWorkerExit({
+        issueId: issue.id,
+        outcome: "abnormal",
+        reason: "required command unavailable",
+        capabilityFailure: createCommandCapabilityFailure(
+          ERROR_CODES.requiredCommandNotFound,
+        ),
+      });
+    }
+    const secondHold = orchestrator.getState().operatorHolds["2"];
+    trackerState.setCandidates([
+      createIssue({ id: "1", identifier: "ISSUE-1", state: "Backlog" }),
+      second,
+    ]);
+
+    await expect(orchestrator.retryOperatorHold("1")).resolves.toEqual({
+      dispatched: false,
+      released: true,
+      hold: null,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBeUndefined();
+    expect(orchestrator.getState().claimed.has("1")).toBe(false);
+    expect(orchestrator.getState().operatorHolds["2"]).toBe(secondHold);
+    expect(orchestrator.getState().claimed.has("2")).toBe(true);
+  });
+
+  it("preserves the selected hold when explicit retry has no local slot", async () => {
+    const heldIssue = createIssue({ id: "1", identifier: "ISSUE-1" });
+    const occupyingIssue = createIssue({ id: "2", identifier: "ISSUE-2" });
+    const trackerState = createMutableTracker({
+      candidates: [heldIssue],
+      snapshots: [
+        { id: "1", identifier: "ISSUE-1", state: "In Progress" },
+        { id: "2", identifier: "ISSUE-2", state: "In Progress" },
+      ],
+    });
+    const orchestrator = createOrchestrator({
+      tracker: trackerState.tracker,
+      config: createConfig({
+        agent: { maxConcurrentAgents: 1 },
+      }),
+    });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+    const originalHold = orchestrator.getState().operatorHolds["1"];
+    trackerState.setCandidates([occupyingIssue]);
+    await orchestrator.pollTick();
+    expect(Object.keys(orchestrator.getState().running)).toEqual(["2"]);
+    trackerState.setCandidates([heldIssue, occupyingIssue]);
+
+    await expect(orchestrator.retryOperatorHold("1")).resolves.toEqual({
+      dispatched: false,
+      released: false,
+      hold: originalHold,
+    });
+    expect(orchestrator.getState().operatorHolds["1"]).toBe(originalHold);
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+    expect(Object.keys(orchestrator.getState().running)).toEqual(["2"]);
+  });
+
+  it("prevents a poll from duplicating an explicit-retry preflight", async () => {
+    const retrySpawnStarted = createDeferred<void>();
+    const retrySpawn = createDeferred<{
+      workerHandle: unknown;
+      monitorHandle: unknown;
+    }>();
+    let spawnCount = 0;
+    const spawnWorker = vi.fn(async () => {
+      spawnCount += 1;
+      if (spawnCount === 1) {
+        return {
+          workerHandle: { pid: 1001 },
+          monitorHandle: { ref: "monitor-1" },
+        };
+      }
+      retrySpawnStarted.resolve(undefined);
+      return await retrySpawn.promise;
+    });
+    const orchestrator = createOrchestrator({
+      spawnWorker,
+      config: createConfig({
+        commands: {
+          rg: { hooks: [], agent: true, probeArgs: ["--version"] },
+        },
+      }),
+    });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+
+    const retry = orchestrator.retryOperatorHold("1");
+    await retrySpawnStarted.promise;
+    const concurrentPoll = await orchestrator.pollTick();
+    expect(concurrentPoll.dispatchedIssueIds).toEqual([]);
+    expect(spawnWorker).toHaveBeenCalledTimes(2);
+
+    retrySpawn.resolve({
+      workerHandle: { pid: 1002 },
+      monitorHandle: { ref: "monitor-2" },
+    });
+    await expect(retry).resolves.toEqual({
+      dispatched: true,
+      released: false,
+      hold: null,
+    });
+    expect(spawnWorker).toHaveBeenCalledTimes(2);
+  });
+
+  it("prevents concurrent explicit retries from duplicating a preflight", async () => {
+    const retryCandidates = createDeferred<Issue[]>();
+    const retrySpawn = createDeferred<{
+      workerHandle: unknown;
+      monitorHandle: unknown;
+    }>();
+    const candidateFetchesStarted = createDeferred<void>();
+    let candidateFetchCount = 0;
+    const issue = createIssue({ id: "1", identifier: "ISSUE-1" });
+    const tracker: IssueTracker = {
+      ...createTracker(),
+      async fetchCandidateIssues() {
+        candidateFetchCount += 1;
+        if (candidateFetchCount === 1) {
+          return [issue];
+        }
+        if (candidateFetchCount === 3) {
+          candidateFetchesStarted.resolve(undefined);
+        }
+        return await retryCandidates.promise;
+      },
+    };
+    let spawnCount = 0;
+    const spawnWorker = vi.fn(async () => {
+      spawnCount += 1;
+      if (spawnCount === 1) {
+        return {
+          workerHandle: { pid: 1001 },
+          monitorHandle: { ref: "monitor-1" },
+        };
+      }
+      return await retrySpawn.promise;
+    });
+    const orchestrator = createOrchestrator({ tracker, spawnWorker });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+
+    const firstRetry = orchestrator.retryOperatorHold("1");
+    const secondRetry = orchestrator.retryOperatorHold("1");
+    await candidateFetchesStarted.promise;
+    retryCandidates.resolve([issue]);
+    await vi.waitFor(() => {
+      expect(spawnWorker).toHaveBeenCalledTimes(2);
+    });
+
+    retrySpawn.resolve({
+      workerHandle: { pid: 1002 },
+      monitorHandle: { ref: "monitor-2" },
+    });
+    const results = await Promise.all([firstRetry, secondRetry]);
+    expect(results.filter((result) => result.dispatched)).toHaveLength(1);
+    expect(spawnWorker).toHaveBeenCalledTimes(2);
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+    expect(orchestrator.getState().running["1"]).toBeDefined();
+  });
+
+  it("preserves held state when reconciliation refresh fails", async () => {
+    const tracker: IssueTracker = {
+      ...createTracker(),
+      fetchIssueStatesByIds: vi
+        .fn()
+        .mockRejectedValue(new Error("tracker temporarily unavailable")),
+    };
+    const orchestrator = createOrchestrator({ tracker });
+
+    await orchestrator.pollTick();
+    orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      reason: "required command unavailable",
+      capabilityFailure: createCommandCapabilityFailure(
+        ERROR_CODES.requiredCommandNotFound,
+      ),
+    });
+    const hold = orchestrator.getState().operatorHolds["1"];
+
+    const poll = await orchestrator.pollTick();
+    expect(poll.reconciliationFetchFailed).toBe(true);
+    expect(orchestrator.getState().operatorHolds["1"]).toBe(hold);
+    expect(orchestrator.getState().claimed.has("1")).toBe(true);
+  });
+
   it("applies codex session events to the running entry and aggregate counters", async () => {
     const orchestrator = createOrchestrator();
 
@@ -770,6 +1385,8 @@ function createOrchestrator(overrides?: {
   tracker?: IssueTracker;
   timerScheduler?: ReturnType<typeof createFakeTimerScheduler>;
   stopRunningIssue?: OrchestratorCoreOptions["stopRunningIssue"];
+  cleanupHeldIssue?: OrchestratorCoreOptions["cleanupHeldIssue"];
+  spawnWorker?: OrchestratorCoreOptions["spawnWorker"];
   now?: () => Date;
 }) {
   const tracker =
@@ -781,15 +1398,21 @@ function createOrchestrator(overrides?: {
   const options: OrchestratorCoreOptions = {
     config: overrides?.config ?? createConfig(),
     tracker,
-    spawnWorker: async () => ({
-      workerHandle: { pid: 1001 },
-      monitorHandle: { ref: "monitor-1" },
-    }),
+    spawnWorker:
+      overrides?.spawnWorker ??
+      (async () => ({
+        workerHandle: { pid: 1001 },
+        monitorHandle: { ref: "monitor-1" },
+      })),
     now: overrides?.now ?? (() => new Date("2026-03-06T00:00:05.000Z")),
   };
 
   if (overrides?.stopRunningIssue !== undefined) {
     options.stopRunningIssue = overrides.stopRunningIssue;
+  }
+
+  if (overrides?.cleanupHeldIssue !== undefined) {
+    options.cleanupHeldIssue = overrides.cleanupHeldIssue;
   }
 
   if (overrides?.timerScheduler !== undefined) {
@@ -821,6 +1444,19 @@ function createTracker(input?: {
 function createConfig(overrides?: {
   agent?: Partial<ResolvedWorkflowConfig["agent"]>;
   codex?: Partial<ResolvedWorkflowConfig["codex"]>;
+  commands?: Record<
+    string,
+    {
+      hooks: readonly (
+        | "afterCreate"
+        | "beforeRun"
+        | "afterRun"
+        | "beforeRemove"
+      )[];
+      agent: boolean;
+      probeArgs: readonly string[];
+    }
+  >;
 }): ResolvedWorkflowConfig {
   return {
     workflowPath: "/tmp/WORKFLOW.md",
@@ -873,6 +1509,7 @@ function createConfig(overrides?: {
         required: false,
         credentialSource: "environment",
       },
+      commands: overrides?.commands ?? {},
     },
     server: {
       port: null,
@@ -914,6 +1551,76 @@ function createFakeTimerScheduler() {
       return { callback, delayMs } as unknown as ReturnType<typeof setTimeout>;
     },
     clear() {},
+  };
+}
+
+function createCommandCapabilityFailure(
+  code:
+    | typeof ERROR_CODES.requiredCommandNotFound
+    | typeof ERROR_CODES.requiredCommandExecutionDenied
+    | typeof ERROR_CODES.requiredCommandCapabilityTransient,
+  boundary:
+    | "agent"
+    | "hook:after_create"
+    | "hook:before_run"
+    | "hook:after_run"
+    | "hook:before_remove" = "agent",
+) {
+  return {
+    code,
+    capability: "external_command",
+    command: "rg",
+    boundary,
+    remediation:
+      "Install rg in the agent execution environment, then explicitly retry the held issue.",
+  } as const;
+}
+
+function createDeferred<T>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+
+  return {
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+  };
+}
+
+function createMutableTracker(input?: {
+  candidates?: Issue[];
+  snapshots?: IssueStateSnapshot[];
+}) {
+  let candidates = input?.candidates ?? [
+    createIssue({ id: "1", identifier: "ISSUE-1" }),
+  ];
+  let snapshots: IssueStateSnapshot[] = input?.snapshots ?? [
+    { id: "1", identifier: "ISSUE-1", state: "In Progress" },
+  ];
+  const tracker: IssueTracker = {
+    async fetchCandidateIssues() {
+      return candidates;
+    },
+    async fetchIssuesByStates() {
+      return [];
+    },
+    async fetchIssueStatesByIds() {
+      return snapshots;
+    },
+  };
+
+  return {
+    tracker,
+    setCandidates(next: Issue[]) {
+      candidates = next;
+    },
+    setSnapshots(next: IssueStateSnapshot[]) {
+      snapshots = next;
+    },
   };
 }
 

@@ -385,6 +385,154 @@ describe("OrchestratorRuntimeHost", () => {
     });
     expect(host.getState().retryAttempts["1"]).toBeUndefined();
   });
+
+  it("preserves sanitized external-command diagnostics in worker logs, holds, snapshots, and details", async () => {
+    const tracker = createTracker();
+    const fakeRunner = new FakeAgentRunner();
+    const entries: StructuredLogEntry[] = [];
+    const host = new OrchestratorRuntimeHost({
+      config: createConfig(),
+      tracker,
+      logger: new StructuredLogger([
+        {
+          write(entry) {
+            entries.push(entry);
+          },
+        },
+      ]),
+      createAgentRunner: ({ onEvent }) => {
+        fakeRunner.onEvent = onEvent;
+        return fakeRunner;
+      },
+      now: () => new Date("2026-03-06T00:00:05.000Z"),
+    });
+    const secretPath =
+      "PATH=C:\\Users\\operator\\.codex\\vendor\\rg;token=secret-token";
+    const rawProbeOutput = `rg missing; ${secretPath}`;
+    const remediation =
+      "Install rg in the hook execution environment, then explicitly retry the held issue.";
+    const error = Object.assign(
+      new Error(
+        "Required command rg is unavailable in the before_run hook boundary.",
+      ),
+      {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "hook:before_run",
+        remediation,
+        rawPath: secretPath,
+        stdout: rawProbeOutput,
+        stderr: "Authorization: Bearer secret-token",
+      },
+    );
+
+    await host.pollOnce();
+    fakeRunner.reject("1", error);
+    await host.waitForIdle();
+
+    expect(entries).toContainEqual(
+      expect.objectContaining({
+        event: "worker_exit_abnormal",
+        error_code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "hook:before_run",
+        remediation,
+      }),
+    );
+    expect(host.getState().operatorHolds["1"]).toMatchObject({
+      capabilityFailure: {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "hook:before_run",
+        remediation,
+      },
+    });
+    expect(host.getState().retryAttempts["1"]).toBeUndefined();
+
+    const snapshot = await host.getRuntimeSnapshot();
+    expect(snapshot.holds).toEqual([
+      expect.objectContaining({
+        capability_failure: {
+          code: ERROR_CODES.requiredCommandNotFound,
+          capability: "external_command",
+          command: "rg",
+          boundary: "hook:before_run",
+          remediation,
+        },
+      }),
+    ]);
+    await expect(host.getIssueDetails("ISSUE-1")).resolves.toMatchObject({
+      hold: {
+        capability_failure: {
+          code: ERROR_CODES.requiredCommandNotFound,
+          capability: "external_command",
+          command: "rg",
+          boundary: "hook:before_run",
+          remediation,
+        },
+      },
+    });
+
+    const operatorSurfaces = JSON.stringify({
+      entries,
+      hold: host.getState().operatorHolds["1"],
+      snapshot,
+      details: await host.getIssueDetails("ISSUE-1"),
+    });
+    expect(operatorSurfaces).not.toContain(secretPath);
+    expect(operatorSurfaces).not.toContain(rawProbeOutput);
+    expect(operatorSurfaces).not.toContain("secret-token");
+    expect(operatorSurfaces).not.toContain("Authorization");
+  });
+
+  it("cleans and releases a terminal held issue through the workspace manager", async () => {
+    const tracker = createTracker();
+    const fakeRunner = new FakeAgentRunner();
+    const removeForIssue = vi.fn().mockResolvedValue(undefined);
+    const host = new OrchestratorRuntimeHost({
+      config: createConfig(),
+      tracker,
+      workspaceManager: {
+        removeForIssue,
+        resolveForIssue: vi.fn(() => ({
+          workspaceKey: "1",
+          workspacePath: "/tmp/workspaces/1",
+        })),
+      } as never,
+      createAgentRunner: ({ onEvent }) => {
+        fakeRunner.onEvent = onEvent;
+        return fakeRunner;
+      },
+      now: () => new Date("2026-03-06T00:00:05.000Z"),
+    });
+
+    await host.pollOnce();
+    fakeRunner.reject(
+      "1",
+      Object.assign(new Error("Required command rg is unavailable."), {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "agent",
+        remediation:
+          "Install rg in the agent execution environment, then explicitly retry the held issue.",
+      }),
+    );
+    await host.waitForIdle();
+    tracker.setCandidates([]);
+    tracker.setStateSnapshots([
+      { id: "1", identifier: "ISSUE-1", state: "Done" },
+    ]);
+
+    await host.pollOnce();
+
+    expect(removeForIssue).toHaveBeenCalledWith("1");
+    expect(host.getState().operatorHolds["1"]).toBeUndefined();
+    expect(host.getState().claimed.has("1")).toBe(false);
+  });
 });
 
 class FakeAgentRunner {
@@ -445,6 +593,15 @@ class FakeAgentRunner {
     }
     this.runs.delete(issueId);
     run.resolve(result);
+  }
+
+  reject(issueId: string, error: Error): void {
+    const run = this.runs.get(issueId);
+    if (run === undefined) {
+      throw new Error(`No fake run registered for ${issueId}.`);
+    }
+    this.runs.delete(issueId);
+    run.reject(error);
   }
 }
 
@@ -540,6 +697,7 @@ function createConfig(): ResolvedWorkflowConfig {
         required: false,
         credentialSource: "environment",
       },
+      commands: {},
     },
     server: {
       port: null,

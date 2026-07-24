@@ -185,6 +185,26 @@ If a specific external CLI still does not see the credentials or executable path
 environment, provide that tool's credential via environment variables before launching Symphony and
 consider prefixing `codex.command` with an explicit `PATH=...`.
 
+Declare required external commands explicitly when a workflow depends on them:
+
+```yaml
+capabilities:
+  commands:
+    rg:
+      hooks: [after_create, before_run]
+      agent: true
+      probe_args: [--version]
+```
+
+This feature is opt-in: omitting `capabilities.commands` is a true no-op. Hook requirements are
+resolved inside the same `sh -lc` invocation as the hook body, while agent requirements are probed
+through the same Codex app-server, cwd, environment, and sandbox used for the turn. A command
+declared in both places must pass both checks. Missing or execution-denied commands pause the issue
+on an operator hold with sanitized remediation; transient probe failures use normal retry backoff.
+Symphony does not discover or inject Codex's bundled `rg`: that path is private to a particular
+Codex installation, would change command precedence, and would not prove availability in both
+execution boundaries.
+
 For GitHub workflows, `capabilities.github.credential_source: gh_auth_token` can reuse a one-time
 `gh auth login`: when no explicit `GH_TOKEN` or `GITHUB_TOKEN` exists, Symphony reads the current
 GitHub CLI token and passes it only in memory to the worker's Codex app-server. The sandboxed GitHub

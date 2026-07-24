@@ -1,4 +1,8 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  spawn,
+} from "node:child_process";
 
 import { ERROR_CODES } from "../errors/codes.js";
 
@@ -14,6 +18,9 @@ const DEFAULT_CAPABILITIES = Object.freeze({
 
 const DEFAULT_MAX_LINE_BYTES = 10 * 1024 * 1024;
 const WINDOWS_SESSION_REQUEST_TIMEOUT_MS = 30_000;
+const PROCESS_TERMINATION_GRACE_MS = 1_000;
+const PROCESS_FORCE_KILL_GRACE_MS = 1_000;
+const CLOSED_CHILDREN = new WeakSet<ChildProcess>();
 
 type JsonObject = Record<string, unknown>;
 type JsonRpcId = string | number;
@@ -172,6 +179,7 @@ export class CodexAppServerClient {
   private lastRateLimits: Record<string, unknown> | null = null;
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private startPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private stderrBuffer = "";
   private closed = false;
   private initialized = false;
@@ -274,7 +282,15 @@ export class CodexAppServerClient {
     return { exitCode, stdout, stderr };
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise === null) {
+      this.closePromise = this.closeInternal();
+    }
+
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     this.closed = true;
     this.rejectPending(
       new CodexAppServerClientError(
@@ -294,25 +310,26 @@ export class CodexAppServerClient {
     }
 
     const child = this.child;
-    this.child = null;
     this.initialized = false;
     this.threadId = null;
     if (child === null) {
       return;
     }
 
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill("SIGTERM");
+    await terminateChildProcess(child);
+    if (this.child === child) {
+      this.child = null;
     }
-
-    await new Promise<void>((resolve) => {
-      child.once("exit", () => {
-        resolve();
-      });
-    });
   }
 
   private async ensureInitialized(): Promise<void> {
+    if (this.closed) {
+      throw new CodexAppServerClientError(
+        "Codex session is closed.",
+        ERROR_CODES.codexProtocolError,
+      );
+    }
+
     if (this.child !== null && this.initialized) {
       return;
     }
@@ -345,6 +362,7 @@ export class CodexAppServerClient {
         cwd: this.options.cwd,
         env: this.options.environment,
         stdio: "pipe",
+        detached: process.platform !== "win32",
       });
     } catch (error) {
       const wrapped = new CodexAppServerClientError(
@@ -361,6 +379,9 @@ export class CodexAppServerClient {
     }
 
     const child = this.child;
+    child.once("close", () => {
+      CLOSED_CHILDREN.add(child);
+    });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
@@ -1378,6 +1399,178 @@ function clearTimeoutIfPresent(timer: NodeJS.Timeout | null): void {
   if (timer !== null) {
     clearTimeout(timer);
   }
+}
+
+async function terminateChildProcess(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (
+    CLOSED_CHILDREN.has(child) &&
+    (process.platform === "win32" ||
+      pid === undefined ||
+      !isUnixProcessGroupAlive(pid))
+  ) {
+    return;
+  }
+
+  try {
+    child.stdin?.end();
+  } catch {
+    // Fall through to process termination.
+  }
+  const closedAfterInput = await waitForChildClose(
+    child,
+    PROCESS_TERMINATION_GRACE_MS,
+  );
+  if (
+    closedAfterInput &&
+    (process.platform === "win32" ||
+      pid === undefined ||
+      !isUnixProcessGroupAlive(pid))
+  ) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const treeTerminated = await terminateWindowsProcessTree(child);
+    if (!treeTerminated) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The direct child may already have exited.
+      }
+    }
+    await waitForChildClose(child, PROCESS_FORCE_KILL_GRACE_MS);
+    return;
+  }
+
+  signalUnixProcessTree(child, "SIGTERM");
+  const childDidCloseAfterTerm = await waitForChildClose(
+    child,
+    PROCESS_TERMINATION_GRACE_MS,
+  );
+  if (
+    childDidCloseAfterTerm &&
+    (pid === undefined || !isUnixProcessGroupAlive(pid))
+  ) {
+    return;
+  }
+
+  signalUnixProcessTree(child, "SIGKILL");
+  await waitForChildClose(child, PROCESS_FORCE_KILL_GRACE_MS);
+}
+
+function isUnixProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "EPERM"
+    );
+  }
+}
+
+function waitForChildClose(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (CLOSED_CHILDREN.has(child)) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (closed: boolean) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeoutHandle);
+      child.off("close", onClose);
+      resolve(closed);
+    };
+    const onClose = () => {
+      finish(true);
+    };
+    const timeoutHandle = setTimeout(() => {
+      finish(false);
+    }, timeoutMs);
+
+    child.once("close", onClose);
+    if (CLOSED_CHILDREN.has(child)) {
+      finish(true);
+    }
+  });
+}
+
+function signalUnixProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to signalling the direct child.
+    }
+  }
+
+  try {
+    child.kill(signal);
+  } catch {
+    // The process may have exited between the close request and the signal.
+  }
+}
+
+function terminateWindowsProcessTree(child: ChildProcess): Promise<boolean> {
+  const pid = child.pid;
+  if (pid === undefined) {
+    return Promise.resolve(false);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (terminated: boolean) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeoutHandle);
+      resolve(terminated);
+    };
+    let taskkill: ChildProcess;
+    try {
+      taskkill = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const timeoutHandle = setTimeout(() => {
+      try {
+        taskkill.kill("SIGKILL");
+      } catch {
+        // The helper may already have exited.
+      }
+      finish(false);
+    }, PROCESS_FORCE_KILL_GRACE_MS);
+    taskkill.once("error", () => {
+      finish(false);
+    });
+    taskkill.once("close", (exitCode) => {
+      finish(exitCode === 0);
+    });
+  });
 }
 
 function toErrorMessage(error: unknown): string {

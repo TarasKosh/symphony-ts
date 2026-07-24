@@ -1,6 +1,12 @@
 import { rm } from "node:fs/promises";
 
 import {
+  type CapabilityFailureMetadata,
+  CodexExternalCommandProbe,
+  type ExternalCommandProbe,
+  getCommandCapabilities,
+} from "../capabilities/external-command.js";
+import {
   CodexAppServerClient,
   type CodexClientEvent,
   type CodexCommandExecInput,
@@ -99,6 +105,7 @@ export interface AgentRunnerOptions {
   environment?: NodeJS.ProcessEnv;
   githubCapabilityProbe?: GithubCapabilityProbe;
   githubCredentialProvider?: GithubCredentialProvider;
+  externalCommandCapabilityProbe?: ExternalCommandProbe;
   onEvent?: (event: AgentRunnerEvent) => void;
 }
 
@@ -129,6 +136,7 @@ export class AgentRunnerError extends Error {
   readonly runAttempt: RunAttempt;
   readonly liveSession: LiveSession;
   readonly capability: string | undefined;
+  readonly capabilityFailure: CapabilityFailureMetadata | undefined;
 
   constructor(input: {
     message: string;
@@ -140,6 +148,7 @@ export class AgentRunnerError extends Error {
     runAttempt: RunAttempt;
     liveSession: LiveSession;
     capability?: string;
+    capabilityFailure?: CapabilityFailureMetadata;
     cause?: unknown;
   }) {
     super(input.message, { cause: input.cause });
@@ -152,6 +161,7 @@ export class AgentRunnerError extends Error {
     this.runAttempt = input.runAttempt;
     this.liveSession = input.liveSession;
     this.capability = input.capability;
+    this.capabilityFailure = input.capabilityFailure;
   }
 }
 
@@ -176,15 +186,21 @@ export class AgentRunner {
 
   private readonly githubCredentialProvider: GithubCredentialProvider;
 
+  private readonly externalCommandCapabilityProbe: ExternalCommandProbe;
+
   private readonly onEvent: ((event: AgentRunnerEvent) => void) | undefined;
 
   constructor(options: AgentRunnerOptions) {
     this.config = options.config;
     this.tracker = options.tracker;
+    this.environment = options.environment ?? process.env;
     this.hooks =
       options.hooks ??
+      options.workspaceManager?.hookRunner ??
       new WorkspaceHookRunner({
         config: options.config.hooks,
+        commands: getCommandCapabilities(options.config),
+        environment: this.environment,
       });
     this.workspaceManager =
       options.workspaceManager ??
@@ -195,11 +211,12 @@ export class AgentRunner {
     this.createCodexClient =
       options.createCodexClient ?? createDefaultCodexClient;
     this.fetchFn = options.fetchFn;
-    this.environment = options.environment ?? process.env;
     this.githubCapabilityProbe =
       options.githubCapabilityProbe ?? new GhGithubCapabilityProbe();
     this.githubCredentialProvider =
       options.githubCredentialProvider ?? new GhAuthTokenCredentialProvider();
+    this.externalCommandCapabilityProbe =
+      options.externalCommandCapabilityProbe ?? new CodexExternalCommandProbe();
     this.onEvent = options.onEvent;
   }
 
@@ -253,10 +270,19 @@ export class AgentRunner {
         workspace.path,
       );
       let codexEnvironment = this.environment;
+      const agentCommands = Object.entries(
+        getCommandCapabilities(this.config),
+      ).filter(([, requirement]) => requirement.agent);
 
       if (this.config.capabilities.github.required) {
-        runAttempt.status = "validating_capabilities";
         codexEnvironment = await this.resolveGithubEnvironment();
+      }
+
+      if (
+        agentCommands.length > 0 ||
+        this.config.capabilities.github.required
+      ) {
+        runAttempt.status = "validating_capabilities";
         client = this.createCodexClient({
           command: this.config.codex.command,
           cwd: workspace.path,
@@ -281,11 +307,23 @@ export class AgentRunner {
           },
         });
         abortController.bindClient(client);
-        await this.githubCapabilityProbe.probe({
-          workspacePath: workspace.path,
-          sandboxPolicy: turnSandboxPolicy,
-          executor: client,
-        });
+        for (const [command, requirement] of agentCommands) {
+          await this.externalCommandCapabilityProbe.probe({
+            command,
+            probeArgs: requirement.probeArgs,
+            workspacePath: workspace.path,
+            sandboxPolicy: turnSandboxPolicy,
+            executor: client,
+          });
+        }
+
+        if (this.config.capabilities.github.required) {
+          await this.githubCapabilityProbe.probe({
+            workspacePath: workspace.path,
+            sandboxPolicy: turnSandboxPolicy,
+            executor: client,
+          });
+        }
       }
 
       issue = await this.claimIssueBeforeAgent(issue);
@@ -713,18 +751,21 @@ export class AgentRunner {
       typeof input.error.code === "string"
         ? input.error.code
         : undefined;
+    const capabilityFailure = extractCapabilityFailure(input.error);
     const capability =
-      typeof input.error === "object" &&
+      capabilityFailure?.capability ??
+      (typeof input.error === "object" &&
       input.error !== null &&
       "capability" in input.error &&
       typeof input.error.capability === "string"
         ? input.error.capability
-        : undefined;
+        : undefined);
 
     return new AgentRunnerError({
       message,
       ...(code === undefined ? {} : { code }),
       ...(capability === undefined ? {} : { capability }),
+      ...(capabilityFailure === undefined ? {} : { capabilityFailure }),
       status: classifyFailureStatus(code),
       failedPhase: input.runAttempt.status,
       issue: input.issue,
@@ -734,6 +775,44 @@ export class AgentRunner {
       cause: input.error,
     });
   }
+}
+
+function extractCapabilityFailure(
+  error: unknown,
+): CapabilityFailureMetadata | undefined {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("capabilityFailure" in error) ||
+    typeof error.capabilityFailure !== "object" ||
+    error.capabilityFailure === null
+  ) {
+    return undefined;
+  }
+
+  const failure = error.capabilityFailure;
+  if (
+    !("code" in failure) ||
+    typeof failure.code !== "string" ||
+    !("capability" in failure) ||
+    typeof failure.capability !== "string" ||
+    !("command" in failure) ||
+    typeof failure.command !== "string" ||
+    !("boundary" in failure) ||
+    typeof failure.boundary !== "string" ||
+    !("remediation" in failure) ||
+    typeof failure.remediation !== "string"
+  ) {
+    return undefined;
+  }
+
+  return {
+    code: failure.code,
+    capability: failure.capability,
+    command: failure.command,
+    boundary: failure.boundary as CapabilityFailureMetadata["boundary"],
+    remediation: failure.remediation,
+  };
 }
 
 async function cleanupWorkspaceArtifacts(workspacePath: string): Promise<void> {

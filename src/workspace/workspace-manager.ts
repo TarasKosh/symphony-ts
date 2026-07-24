@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 
+import { ExternalCommandCapabilityError } from "../capabilities/external-command.js";
 import type { Workspace } from "../domain/model.js";
 import { ERROR_CODES } from "../errors/codes.js";
 import type { WorkspaceHookRunner } from "./hooks.js";
@@ -16,6 +17,8 @@ interface FileSystemLike {
     path: string,
     options?: { force?: boolean; recursive?: boolean },
   ): Promise<void>;
+  readdir(path: string): Promise<unknown[]>;
+  rmdir(path: string): Promise<void>;
 }
 
 export interface WorkspaceManagerOptions {
@@ -35,6 +38,10 @@ export class WorkspaceManager {
     this.#hooks = isHookRunner(options.hooks) ? options.hooks : null;
   }
 
+  get hookRunner(): WorkspaceHookRunner | null {
+    return this.#hooks;
+  }
+
   resolveForIssue(issueId: string): WorkspacePathInfo {
     return resolveWorkspacePath(this.root, issueId);
   }
@@ -42,10 +49,11 @@ export class WorkspaceManager {
   async createForIssue(issueId: string): Promise<Workspace> {
     const { workspaceKey, workspacePath, workspaceRoot } =
       this.resolveForIssue(issueId);
+    let createdNow = false;
 
     try {
       await this.#fs.mkdir(workspaceRoot, { recursive: true });
-      const createdNow = await this.#ensureWorkspaceDirectory(workspacePath);
+      createdNow = await this.#ensureWorkspaceDirectory(workspacePath);
       const workspace = {
         path: workspacePath,
         workspaceKey,
@@ -61,6 +69,14 @@ export class WorkspaceManager {
 
       return workspace;
     } catch (error) {
+      if (createdNow) {
+        await this.#removeNewEmptyWorkspaceBestEffort(issueId, workspacePath);
+      }
+
+      if (error instanceof ExternalCommandCapabilityError) {
+        throw error;
+      }
+
       if (error instanceof WorkspacePathError) {
         throw error;
       }
@@ -145,6 +161,32 @@ export class WorkspaceManager {
       }
 
       throw error;
+    }
+  }
+
+  async #removeNewEmptyWorkspaceBestEffort(
+    issueId: string,
+    expectedWorkspacePath: string,
+  ): Promise<void> {
+    try {
+      const resolved = this.resolveForIssue(issueId);
+      if (resolved.workspacePath !== expectedWorkspacePath) {
+        return;
+      }
+
+      const current = await this.#fs.lstat(expectedWorkspacePath);
+      if (!current.isDirectory()) {
+        return;
+      }
+
+      const entries = await this.#fs.readdir(expectedWorkspacePath);
+      if (entries.length !== 0) {
+        return;
+      }
+
+      await this.#fs.rmdir(expectedWorkspacePath);
+    } catch {
+      // Cleanup is deliberately best-effort and must not mask the hook failure.
     }
   }
 }

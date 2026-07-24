@@ -192,13 +192,13 @@ Examples:
 
 #### 4.1.4 Workspace
 
-Filesystem workspace assigned to one issue identifier.
+Filesystem workspace assigned to one stable issue key.
 
 Fields (logical):
 
 - `path` (workspace path; current runtime typically uses absolute paths, but relative roots are
   possible if configured without path separators)
-- `workspace_key` (sanitized issue identifier)
+- `workspace_key` (sanitized stable issue key; the TypeScript implementation uses `issue.id`)
 - `created_now` (boolean, used to gate `after_create` hook)
 
 #### 4.1.5 Run Attempt
@@ -249,8 +249,23 @@ Fields:
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
+- `capability_failure` (optional sanitized capability metadata; see Section 14.1)
 
-#### 4.1.8 Orchestrator Runtime State
+#### 4.1.8 Operator Hold Entry
+
+An issue paused for deterministic operator action. A held issue remains claimed but has no retry
+timer.
+
+Fields:
+
+- `issue_id`
+- `identifier` (best-effort human ID)
+- `attempt` (next explicit retry attempt)
+- `held_at_ms`
+- `error` (sanitized compatibility string)
+- `capability_failure` (optional sanitized capability metadata; see Section 14.1)
+
+#### 4.1.9 Orchestrator Runtime State
 
 Single authoritative in-memory state owned by the orchestrator.
 
@@ -259,8 +274,9 @@ Fields:
 - `poll_interval_ms` (current effective poll interval)
 - `max_concurrent_agents` (current effective global concurrency limit)
 - `running` (map `issue_id -> running entry`)
-- `claimed` (set of issue IDs reserved/running/retrying)
+- `claimed` (set of issue IDs reserved, running, retrying, or held)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
+- `operator_holds` (map `issue_id -> OperatorHoldEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -270,9 +286,11 @@ Fields:
 - `Issue ID`
   - Use for tracker lookups and internal map keys.
 - `Issue Identifier`
-  - Use for human-readable logs and workspace naming.
+  - Use only for human-readable logs and status surfaces unless an implementation explicitly
+    selects it as its stable workspace input.
 - `Workspace Key`
-  - Derive from `issue.identifier` by replacing any character not in `[A-Za-z0-9._-]` with `_`.
+  - Derive from one implementation-selected stable issue input by replacing any character not in
+    `[A-Za-z0-9._-]` with `_`. The TypeScript implementation always selects `issue.id`.
   - Use the sanitized value for the workspace directory name.
 - `Normalized Issue State`
   - Compare states after `trim` + `lowercase`.
@@ -454,6 +472,110 @@ fields locally if they want stricter startup checks.
 External capabilities are opt-in. Omitting this object preserves the existing dispatch and agent
 startup behavior.
 
+- `commands` (map `executable_basename -> command requirement`)
+  - Default: `{}`.
+  - Each key is the executable basename that the workflow requires. Keys must match
+    `[A-Za-z0-9][A-Za-z0-9._-]*` and must not be `.` or `..`; whitespace, path separators, absolute
+    or relative paths, control characters, and shell metacharacters are invalid.
+  - Each value is an object with these fields:
+    - `hooks` (list of `after_create`, `before_run`, `after_run`, or `before_remove`)
+      - Default: `[]`.
+      - A declared command is checked independently in every listed hook boundary.
+    - `agent` (boolean)
+      - Default: `false`.
+      - When `true`, the command is checked in the Codex command boundary before tracker claim and
+        before `thread/start` or `turn/start`.
+    - `probe_args` (list of strings)
+      - Default: `[]`.
+      - Used only by the agent-boundary probe. Arguments are passed as a direct argv vector and are
+        never interpolated into a shell command or included in diagnostics.
+  - The declaration schema is closed: unknown fields and duplicate hook names are invalid. Hook and
+    probe argument order is preserved. Probe arguments containing ASCII control characters,
+    including NUL, are invalid because they cannot be passed portably as direct process arguments.
+  - A declaration must enable at least one hook or the agent boundary. Non-map declarations,
+    unknown hook names, non-boolean `agent`, non-list, non-string, or control-character probe
+    arguments, unsafe command keys, and declarations with no enabled boundary fail dispatch as
+    `config_invalid`.
+  - Omitting `capabilities` or `capabilities.commands` selects the empty default. Explicit `null`,
+    scalar, or list values for either object are malformed and fail as `config_invalid`.
+  - The same `config_invalid` result fails startup validation, skips per-tick dispatch, and rejects
+    a dynamic reload while the runtime keeps using the last known good effective configuration.
+  - Omission is a true no-op: an empty command map adds no hook script, subprocess, app-server
+    initialization, command probe, tracker-claim deferral, retry dependency, or log entry.
+  - A command declaration naming a hook creates that hook boundary even when the corresponding
+    workflow hook script is omitted: Symphony runs one preflight-only `sh -lc` invocation with an
+    empty body. This is an effect of the explicit declaration, not of the empty default.
+  - Hook requirements are checked inside the same hook-shell invocation and explicit environment
+    as the hook body, immediately before that body. The TypeScript implementation's hook shell is
+    `sh -lc`; ports using another host-appropriate shell must still compose one invocation.
+  - Hook preflight is resolution and execute-permission validation only; it never invokes the
+    required command. For each declaration, the generated prefix first uses the shell's real
+    command lookup. A resolved filesystem path without execute permission is
+    `required_command_execution_denied`. If lookup fails, the prefix scans the effective PATH
+    internally for a matching non-executable basename (and `<basename>.exe` on Windows) to
+    distinguish denied from absent; PATH and candidate paths are never emitted. No match is
+    `required_command_not_found`.
+  - Each hook invocation uses at least 128 bits from a cryptographically secure random source for
+    its hexadecimal nonce. A failed hook check emits exactly one line in the form
+    `__SYMPHONY_REQUIRED_COMMAND_V1__:<nonce>:<code>:<basename>` and exits before the workflow body
+    with `126` for denied or `127` for absent. The nonce is a fresh Symphony-generated hexadecimal
+    value used only for that invocation. The runner recognizes only an exact marker containing the
+    current nonce, one of the current hook's declared basenames, and the matching fixed exit code.
+  - After all checks pass, the prefix emits one owned
+    `__SYMPHONY_REQUIRED_COMMAND_V1__:<nonce>:ok` marker and then begins the workflow body. The
+    runner strips owned markers from captured output. Once the current invocation's success marker
+    exists, no later workflow output can be interpreted as a capability failure, even if the body
+    exits `126`/`127` or prints marker-like text.
+  - Before the owned success marker, a valid failure marker with its matching exit status is a
+    deterministic command failure. A launched hook shell that times out, exits, or produces an
+    otherwise unclassified result before either valid marker is
+    `required_command_capability_transient`. After the owned success marker, failures and timeouts
+    are ordinary hook-body `hook_failed` or `hook_timed_out` outcomes. Failure to launch the hook
+    shell means the command boundary was never entered and remains a non-timeout `hook_failed`.
+  - Generated shell code is fixed by Symphony, never uses `eval`, disables pathname expansion while
+    scanning PATH, treats each PATH entry and command name only as data, quotes every parameter
+    expansion used as a path, and restores shell state before the workflow body. Arbitrary workflow
+    stdout/stderr is never parsed for capability meaning.
+  - Agent requirements are checked through the same Codex app-server instance that will own the
+    worker session. Each `command/exec` receives the ticket workspace cwd, inherited app-server
+    environment, and prepared `turn_sandbox_policy`. A successful check in a hook shell is not
+    proof for the agent boundary, and a successful agent check is not proof for a hook boundary.
+  - Agent probes pass `[declared_basename, ...probe_args]` directly to `command/exec`, with one
+    exception: on Windows, an extensionless safe basename such as `rg` is passed as `rg.exe`.
+    Symphony performs no parent-side PATH lookup or path resolution. An explicitly declared
+    extension is preserved, and `.cmd`/`.bat` wrappers are not inferred.
+  - Agent probe success requires exit code `0`. Empty `probe_args` means the executable is invoked
+    with no arguments and must therefore exit successfully; authors should declare a
+    side-effect-free argument such as `--version` when no-argument behavior is not a successful
+    probe.
+  - Agent exit `127` or an app-server/OS not-found signal maps to
+    `required_command_not_found`. Exit `126`, `EACCES`/`EPERM`, or an app-server/OS
+    execution-denied signal maps to `required_command_execution_denied`. Other non-zero exits,
+    malformed responses, timeout, protocol failure, and unrecognized errors map to
+    `required_command_capability_transient`. Implementations may inspect bounded probe output to
+    recognize platform not-found/denied signals, but may never propagate that output.
+  - Generic command probes use a `60000` ms command timeout on Windows and `15000` ms elsewhere.
+    The client-side response timer adds `codex.read_timeout_ms` to that command budget. Probe output
+    is bounded to 64 KiB per stream where custom command caps are supported; Windows uses the
+    app-server's built-in bounded capture.
+  - A fatal `after_create` or `before_run` command failure and any agent-boundary command failure
+    follows the deterministic-hold/transient-retry rules above. `after_run` and `before_remove`
+    preserve their existing best-effort semantics: their typed capability failure is logged with
+    sanitized metadata, but does not change the completed attempt, create a hold, or prevent
+    cleanup.
+  - Capability failures use the stable metadata object
+    `{code, capability, command, boundary, remediation}`. Generic command failures set capability
+    to `external_command`; boundary is one of `hook:after_create`, `hook:before_run`,
+    `hook:after_run`, `hook:before_remove`, or `agent`. Structured logs flatten these fields;
+    retry/hold state, snapshots, and operator-facing JSON retain them as `capability_failure` while
+    preserving the existing `error` string for compatibility.
+  - Only that sanitized metadata may cross the capability boundary. Raw PATH values, resolved
+    paths, probe output, hook stdout/stderr, argv probe values, credentials, and authorization
+    material must never enter the error message, structured state, logs, snapshots, or status
+    surfaces.
+  - Symphony validates declared requirements but does not install a command, synthesize PATH, or
+    discover and inject a provider's private bundled executable. In particular, a Codex-bundled
+    `rg` path is not a Symphony runtime contract and must not be borrowed automatically.
 - `github.required` (boolean or boolean string)
   - Default: `false`.
   - When `true`, each worker must verify GitHub CLI authentication and push access to the repository
@@ -591,6 +713,8 @@ Validation checks:
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when required by the selected tracker kind.
 - `codex.command` is present and non-empty.
+- Every `capabilities.commands` key and declaration is structurally valid, enables at least one
+  execution boundary, and contains only supported hook names and string argv probe values.
 
 ### 6.4 Config Fields Summary (Cheat Sheet)
 
@@ -620,6 +744,10 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `capabilities.commands`: map of safe executable basenames to boundary requirements, default `{}`
+- `capabilities.commands.<command>.hooks`: list of hook names, default `[]`
+- `capabilities.commands.<command>.agent`: boolean, default `false`
+- `capabilities.commands.<command>.probe_args`: direct argv string list, default `[]`
 - `capabilities.github.required`: boolean, default `false`
 - `capabilities.github.credential_source`: `environment` or `gh_auth_token`, default `environment`
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
@@ -640,7 +768,7 @@ claim state.
 
 2. `Claimed`
    - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - In practice, claimed issues are `Running`, `RetryQueued`, or `Held`.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
@@ -648,7 +776,13 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `Held`
+   - Worker is not running and a deterministic capability or lifecycle failure requires operator
+     action.
+   - Issue remains in `claimed` and `operator_holds`, with no retry timer.
+   - Ordinary polling must not redispatch it.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -709,6 +843,12 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Retry Timer Fired`
   - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
 
+- `Explicit Operator Retry`
+  - Select one held issue, re-fetch that issue, remove only its hold immediately before dispatch,
+    and rerun every applicable boundary check.
+  - If the issue is no longer eligible, release its claim. If the same deterministic failure
+    recurs, create a fresh hold without affecting any other held issue.
+
 - `Reconciliation State Refresh`
   - Stop runs whose issue states are terminal or no longer active.
 
@@ -719,6 +859,17 @@ Distinct terminal reasons are important because retry logic and logs differ.
 
 - The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
 - `claimed` and `running` checks are required before launching any worker.
+- The orchestrator's local `claimed` reservation is distinct from tracker lifecycle claim
+  write-back. Dispatch starts a worker handle and atomically records it in `running` and `claimed`
+  before yielding to another poll/retry/control operation. Workspace preparation and pre-dispatch
+  capability checks run inside that locally reserved worker slot, so concurrent ticks cannot start
+  duplicate preflights or exceed concurrency limits.
+- Tracker claim write-back may be deferred until the reserved worker passes its pre-dispatch checks.
+  A deterministic or transient preflight failure returns through the registered worker-exit path,
+  which atomically replaces the local running reservation with a hold or retry. Cancellation and
+  ineligibility release the same reservation through normal reconciliation.
+- Held issues remain claimed and are excluded from polling dispatch until a selected explicit retry
+  or eligibility release.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
@@ -820,19 +971,25 @@ Part A: Stall detection
 
 Part B: Tracker state refresh
 
-- Fetch current issue states for all running issue IDs.
+- Fetch current issue states for all running and held issue IDs.
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
   - If tracker state is still active: update the in-memory issue snapshot.
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
+- For each held issue:
+  - Terminal state -> release the hold and local claim, and clean the workspace.
+  - Active state -> retain the hold without re-probing.
+  - Non-active state or missing issue -> release the hold and local claim without cleanup.
+- Held-state reconciliation never performs tracker claim write-back or capability probing.
 
 ### 8.6 Startup Terminal Workspace Cleanup
 
 When the service starts:
 
 1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
+2. For each returned issue, remove the workspace directory using the implementation's stable
+   workspace key. The TypeScript implementation passes `issue.id`.
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
 This prevents stale terminal workspaces from accumulating after restarts.
@@ -848,7 +1005,7 @@ Workspace root:
 
 Per-issue workspace path:
 
-- `<workspace.root>/<sanitized_issue_identifier>`
+- `<workspace.root>/<sanitized_stable_workspace_key>`
 
 Workspace persistence:
 
@@ -857,16 +1014,27 @@ Workspace persistence:
 
 ### 9.2 Workspace Creation and Reuse
 
-Input: `issue.identifier`
+Input: an implementation-selected stable issue key. The TypeScript implementation uses `issue.id`
+for every workspace-manager operation.
+
+The implementation must persist or deterministically reuse that exact same input for all later
+cleanup. A refreshed human identifier must never redirect cleanup to a different path.
 
 Algorithm summary:
 
-1. Sanitize identifier to `workspace_key`.
+1. Sanitize the implementation-selected stable input to `workspace_key`.
 2. Compute workspace path under workspace root.
 3. Ensure the workspace path exists as a directory.
 4. Mark `created_now=true` only if the directory was created during this call; otherwise
    `created_now=false`.
 5. If `created_now=true`, run `after_create` hook if configured.
+6. If a declared `after_create` command preflight or hook fails and the directory was created by
+   this call, re-resolve and revalidate the exact workspace path and root containment, verify the
+   directory is still empty, then remove it with a non-recursive empty-directory operation.
+   Preserve any pre-existing or populated workspace. An atomic non-recursive removal failure (for
+   example, a concurrent file appeared) must preserve the directory and must not mask the original
+   typed capability error. A later explicit retry recreates a successfully removed workspace and
+   reruns `after_create`.
 
 Notes:
 
@@ -884,8 +1052,10 @@ hooks (for example `after_create` and/or `before_run`).
 Failure handling:
 
 - Workspace population/synchronization failures return an error for the current attempt.
-- If failure happens while creating a brand-new workspace, implementations may remove the partially
-  prepared directory.
+- The standard `after_create` hook failure path may remove only the newly created, still-empty
+  directory through the non-recursive safeguards in Section 9.2. Any broader cleanup of an
+  implementation-defined population step is a separate explicit policy and must preserve the
+  original failure.
 - Reused workspaces should not be destructively reset on population failure unless that policy is
   explicitly chosen and documented.
 
@@ -904,6 +1074,11 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
+- Pass an explicit environment to the hook subprocess.
+- For every command scoped to the hook, prepend a resolution/execution check to the hook body and
+  run the combined payload in one shell invocation. Complete all checks before starting the
+  workflow-owned body.
+- Preserve the original hook script byte-for-byte when no command is declared for that hook.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
@@ -913,6 +1088,18 @@ Failure semantics:
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
+- A declared-command marker produces the typed command capability error instead of `hook_failed`.
+- Only expiry of the configured timeout produces `hook_timed_out`; shell spawn or launch rejection
+  is a non-timeout hook failure.
+
+Command-capability scheduling semantics:
+
+| Hook | Check timing | Failure effect |
+| --- | --- | --- |
+| `after_create` | In the new workspace's hook invocation, before its body and tracker claim | Fatal; deterministic failures hold, transient failures retry; remove only the exact newly-created still-empty directory |
+| `before_run` | In the attempt's hook invocation, before its body and tracker claim | Fatal; deterministic failures hold, transient failures retry |
+| `after_run` | In the post-attempt hook invocation, before its body | Best-effort log only; never changes the attempt result or creates a hold |
+| `before_remove` | In the cleanup hook invocation, before its body | Best-effort log only; never creates a hold or prevents cleanup |
 
 ### 9.5 Safety Invariants
 
@@ -1179,15 +1366,36 @@ The `Agent Runner` wraps workspace + prompt + app-server client.
 Behavior:
 
 1. Create/reuse workspace for issue.
-2. Run `hooks.before_run` when configured.
-3. When `capabilities.github.required` is enabled, resolve its configured credential source,
-   verify authenticated GitHub identity, resolve the workspace target repository, and verify that
-   repository reports push permission without mutating GitHub.
-4. Build prompt from workflow template.
-5. Start app-server session.
-6. Forward app-server events to orchestrator.
-7. On any error, fail the worker attempt; deterministic capability failures enter an operator hold,
+2. Run `hooks.before_run` and its declared command checks in the same shell invocation when
+   configured.
+3. Prepare the turn sandbox and resolve all environment-affecting capability prerequisites,
+   including the optional GitHub credential bridge. Finish this environment construction before
+   creating a shared app-server; its child environment cannot be changed afterwards.
+4. Initialize the shared app-server early when any generic agent command or GitHub capability is
+   declared.
+5. Probe every generic agent command through that app-server using the workspace cwd, prepared
+   sandbox, inherited environment, configured timeout, and declared direct argv.
+6. When `capabilities.github.required` is enabled, verify authenticated GitHub identity, resolve
+   the workspace target repository, and verify that repository reports push permission without
+   mutating GitHub through the same shared app-server.
+7. Claim the tracker issue only after all declared pre-dispatch checks pass. This is tracker
+   lifecycle write-back, not the orchestrator's earlier local `claimed`/`running` reservation.
+   Pre-dispatch checks are
+   `after_create` when a new workspace is created, `before_run`, generic agent probes, and the
+   GitHub probe. A declaration scoped only to `after_run` or `before_remove` does not defer claim.
+8. Build prompt from workflow template.
+9. Start app-server session.
+10. Forward app-server events to orchestrator.
+11. On any error, fail the worker attempt; deterministic capability failures enter an operator hold,
    while transient failures use normal orchestrator retry semantics.
+
+Failure transport:
+
+- A typed capability failure crosses the runner/scheduler boundary as
+  `{error, capability_failure}`.
+- `capability_failure` is the complete sanitized metadata object created by the boundary probe.
+  Worker logging, `on_worker_exit`, retry/hold creation, snapshots, and status APIs propagate that
+  object unchanged rather than reconstructing command, boundary, or remediation from prose.
 
 Note:
 
@@ -1346,6 +1554,10 @@ should return:
 - `running` (list of running session rows)
 - each running row should include `turn_count`
 - `retrying` (list of retry queue rows)
+- `holds` (list of operator-hold rows)
+  - Each row includes issue ID/identifier, attempt, held timestamp, sanitized error string, and
+    optional `capability_failure`.
+- `counts.held`
 - `codex_totals`
   - `input_tokens`
   - `output_tokens`
@@ -1455,7 +1667,8 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
-        "retrying": 1
+        "retrying": 1,
+        "held": 1
       },
       "running": [
         {
@@ -1482,6 +1695,22 @@ Minimum endpoints:
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
+        }
+      ],
+      "holds": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "MT-651",
+          "attempt": 2,
+          "held_at": "2026-02-24T20:15:45Z",
+          "error": "required_command_not_found: required command rg is unavailable at agent",
+          "capability_failure": {
+            "code": "required_command_not_found",
+            "capability": "external_command",
+            "command": "rg",
+            "boundary": "agent",
+            "remediation": "Install rg in the agent execution environment, then explicitly retry the held issue."
+          }
         }
       ],
       "codex_totals": {
@@ -1565,11 +1794,20 @@ Minimum endpoints:
     }
     ```
 
+- `POST /api/v1/holds/<issue_identifier>/retry`
+  - Explicitly retries only the selected operator hold after the operator repairs the declared
+    command, environment, sandbox, credential, or permission.
+  - Returns `202 Accepted` with the selected issue ID/identifier and whether it was dispatched or
+    released.
+  - Returns `404` when the selected issue is not currently held. Repeating a deterministic failure
+    creates a new hold; it never schedules an automatic timer.
+
 API design notes:
 
 - The JSON shapes above are the recommended baseline for interoperability and debugging ergonomics.
 - Implementations may add fields, but should avoid breaking existing fields within a version.
-- Endpoints should be read-only except for operational triggers like `/refresh`.
+- Endpoints should be read-only except for operational triggers like `/refresh` and selected hold
+  retry.
 - Unsupported methods on defined routes should return `405 Method Not Allowed`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it should consume this API rather than duplicating state
@@ -1592,6 +1830,12 @@ API design notes:
    - Hook timeout/failure
 
 3. `External Capability Failures`
+   - `required_command_not_found`: a declared executable is unavailable in a declared hook or agent
+     execution boundary.
+   - `required_command_execution_denied`: a declared executable resolves but that boundary refuses
+     execution.
+   - `required_command_capability_transient`: command resolution/execution timed out, the
+     app-server protocol failed, or the result could not be classified deterministically.
    - `github_cli_not_found`: `gh` cannot be resolved where the configured credential is loaded or
      in the Codex command environment.
    - `github_auth_invalid`: authentication is missing, invalid, expired, or returns HTTP 401.
@@ -1617,6 +1861,17 @@ API design notes:
    - Dashboard render errors
    - Log sink configuration failure
 
+Sanitized capability metadata:
+
+- `code`: stable machine-readable error code.
+- `capability`: stable capability name, such as `external_command` or `github`.
+- `command`: safe declared executable basename when applicable.
+- `boundary`: stable declared boundary when applicable.
+- `remediation`: fixed actionable guidance derived only from safe declaration and boundary values.
+
+The metadata object contains no optional raw diagnostic bag. Resolved executable paths, PATH,
+stdout/stderr, probe argv, environment values, and credentials are forbidden.
+
 ### 14.2 Recovery Behavior
 
 - Dispatch validation failures:
@@ -1628,12 +1883,18 @@ API design notes:
   - Convert to retries with exponential backoff.
 
 - External capability failures:
-  - Put `github_cli_not_found`, `github_auth_invalid`, and `github_permission_denied` into the
-    existing operator hold with no automatic retry timer.
-  - Retry `github_capability_transient` using the normal failure backoff.
-  - Expose only the capability name, stable error code, and sanitized recovery reason in logs and
-    retry/status data. Never include tokens, authorization headers, credential environment values,
-    or raw `gh` output.
+  - Put `required_command_not_found`, `required_command_execution_denied`,
+    `github_cli_not_found`, `github_auth_invalid`, and `github_permission_denied` into the existing
+    operator hold with no automatic retry timer.
+  - Retry `required_command_capability_transient` and `github_capability_transient` using the normal
+    failure backoff.
+  - Expose only the capability name, stable error code, and sanitized command/boundary/remediation
+    context in logs and retry/status data. Never include PATH, probe or hook output, probe argv,
+    tokens, authorization headers, or credential environment values.
+  - A deterministic fatal capability failure atomically removes any retry entry, creates an
+    `operator_holds` entry with no timer, and keeps the issue claimed.
+  - An explicit retry targets exactly one hold, re-fetches eligibility, and reruns all applicable
+    pre-dispatch checks. It does not release or redispatch other held issues.
 
 - Tracker candidate-fetch failures:
   - Skip this tick.
@@ -1761,6 +2022,7 @@ function start_service():
     running: {},
     claimed: set(),
     retry_attempts: {},
+    operator_holds: {},
     completed: set(),
     codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
     codex_rate_limits: null
@@ -1781,7 +2043,7 @@ function start_service():
 
 ```text
 on_tick(state):
-  state = reconcile_running_issues(state)
+  state = reconcile_running_and_held_issues(state)
 
   validation = validate_dispatch_config()
   if validation is not ok:
@@ -1809,28 +2071,43 @@ on_tick(state):
   return state
 ```
 
-### 16.3 Reconcile Active Runs
+### 16.3 Reconcile Active Runs and Holds
 
 ```text
-function reconcile_running_issues(state):
+function reconcile_running_and_held_issues(state):
   state = reconcile_stalled_runs(state)
 
   running_ids = keys(state.running)
-  if running_ids is empty:
+  held_ids = keys(state.operator_holds)
+  tracked_ids = unique(running_ids + held_ids)
+  if tracked_ids is empty:
     return state
 
-  refreshed = tracker.fetch_issue_states_by_ids(running_ids)
+  refreshed = tracker.fetch_issue_states_by_ids(tracked_ids)
   if refreshed failed:
-    log_debug("keep workers running")
+    log_debug("keep workers running and holds claimed")
     return state
 
   for issue in refreshed:
-    if issue.state in terminal_states:
-      state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
-      state.running[issue.id].issue = issue
-    else:
-      state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
+    if issue.id in state.running:
+      if issue.state in terminal_states:
+        state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
+      else if issue.state in active_states:
+        state.running[issue.id].issue = issue
+      else:
+        state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
+
+    if issue.id in state.operator_holds:
+      if issue.state in terminal_states:
+        workspace_manager.remove_for_issue(issue.id)
+        state = release_hold_and_claim(state, issue.id)
+      else if issue.state in active_states:
+        state.operator_holds[issue.id].identifier = issue.identifier
+      else:
+        state = release_hold_and_claim(state, issue.id)
+
+  for held_id in held_ids not present in refreshed:
+    state = release_hold_and_claim(state, held_id)
 
   return state
 ```
@@ -1839,19 +2116,10 @@ function reconcile_running_issues(state):
 
 ```text
 function dispatch_issue(issue, state, attempt):
-  worker = spawn_worker(
-    fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
-  )
-
-  if worker spawn failed:
-    return schedule_retry(state, issue.id, next_attempt(attempt), {
-      identifier: issue.identifier,
-      error: "failed to spawn agent"
-    })
-
+  # Reserve the issue and one concurrency slot before any worker code can run.
   state.running[issue.id] = {
-    worker_handle,
-    monitor_handle,
+    worker_handle: null,
+    monitor_handle: null,
     identifier: issue.identifier,
     issue,
     session_id: null,
@@ -1868,9 +2136,22 @@ function dispatch_issue(issue, state, attempt):
     retry_attempt: normalize_attempt(attempt),
     started_at: now_utc()
   }
-
   state.claimed.add(issue.id)
   state.retry_attempts.remove(issue.id)
+
+  worker = spawn_worker(
+    fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
+  )
+
+  if worker spawn failed:
+    state.running.remove(issue.id)
+    return schedule_retry(state, issue.id, next_attempt(attempt), {
+      identifier: issue.identifier,
+      error: "failed to spawn agent"
+    })
+
+  state.running[issue.id].worker_handle = worker.worker_handle
+  state.running[issue.id].monitor_handle = worker.monitor_handle
   return state
 ```
 
@@ -1878,66 +2159,130 @@ function dispatch_issue(issue, state, attempt):
 
 ```text
 function run_agent_attempt(issue, attempt, orchestrator_channel):
-  workspace = workspace_manager.create_for_issue(issue.identifier)
-  if workspace failed:
-    fail_worker("workspace error")
+  workspace = null
+  app_server = null
 
-  if run_hook("before_run", workspace.path) failed:
-    fail_worker("before_run hook error")
+  try:
+    # The TypeScript profile uses stable issue.id for every workspace-manager call.
+    workspace_result = workspace_manager.create_for_issue(issue.id)
+    if workspace_result failed:
+      fail_worker(
+        workspace_result.error,
+        capability_failure=workspace_result.capability_failure
+      )
+    workspace = workspace_result.workspace
 
-  session = app_server.start_session(workspace=workspace.path)
-  if session failed:
-    run_hook_best_effort("after_run", workspace.path)
-    fail_worker("agent session startup error")
+    before_run_result = run_hook("before_run", workspace.path)
+    if before_run_result failed:
+      fail_worker(
+        before_run_result.error,
+        capability_failure=before_run_result.capability_failure
+      )
 
-  max_turns = config.agent.max_turns
-  turn_number = 1
+    sandbox = prepare_turn_sandbox_policy(workspace.path)
+    app_server_environment = resolve_all_capability_environment()
 
-  while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
-    if prompt failed:
-      app_server.stop_session(session)
+    if generic_agent_commands_declared() or github_capability_required():
+      initialize_result = initialize_app_server(
+        workspace=workspace.path,
+        environment=app_server_environment,
+        sandbox=sandbox
+      )
+      if initialize_result failed:
+        fail_worker("agent app-server initialization failed")
+      app_server = initialize_result.app_server
+
+    for command in declared_generic_agent_commands_in_order():
+      result = app_server.command_exec(
+        argv=[platform_executable_basename(command), ...command.probe_args],
+        cwd=workspace.path,
+        sandbox=sandbox
+      )
+      if result failed:
+        fail_worker(result.error, capability_failure=result.capability_failure)
+
+    if github_capability_required():
+      github_result = probe_github_capability(
+        app_server=app_server,
+        cwd=workspace.path,
+        sandbox=sandbox
+      )
+      if github_result failed:
+        fail_worker(
+          github_result.error,
+          capability_failure=github_result.capability_failure
+        )
+
+    claim_result = tracker.claim_issue_if_configured(issue)
+    if claim_result failed:
+      fail_worker("tracker claim failed")
+    issue = claim_result.issue
+
+    max_turns = config.agent.max_turns
+    turn_number = 1
+
+    while true:
+      prompt_result = build_turn_prompt(
+        workflow_template,
+        issue,
+        attempt,
+        turn_number,
+        max_turns
+      )
+      if prompt_result failed:
+        fail_worker("prompt error")
+
+      if app_server is null:
+        late_initialize_result = initialize_app_server(
+          workspace=workspace.path,
+          environment=app_server_environment,
+          sandbox=sandbox
+        )
+        if late_initialize_result failed:
+          fail_worker("agent app-server initialization failed")
+        app_server = late_initialize_result.app_server
+
+      turn_result =
+        if turn_number == 1:
+          app_server.start_session(
+            prompt=prompt_result.prompt,
+            issue=issue,
+            workspace=workspace.path,
+            sandbox=sandbox
+          )
+        else:
+          app_server.continue_turn(
+            prompt=prompt_result.prompt,
+            issue=issue,
+            workspace=workspace.path,
+            sandbox=sandbox
+          )
+
+      if turn_result failed:
+        fail_worker("agent turn error")
+
+      refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
+      if refreshed_issue failed:
+        fail_worker("issue state refresh error")
+
+      issue = refreshed_issue[0] or issue
+      if issue.state is not active or turn_number >= max_turns:
+        break
+
+      turn_number = turn_number + 1
+
+    exit_normal()
+  finally:
+    if app_server is not null:
+      app_server.stop()
+    if workspace is not null:
       run_hook_best_effort("after_run", workspace.path)
-      fail_worker("prompt error")
-
-    turn_result = app_server.run_turn(
-      session=session,
-      prompt=prompt,
-      issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
-    )
-
-    if turn_result failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("agent turn error")
-
-    refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
-    if refreshed_issue failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("issue state refresh error")
-
-    issue = refreshed_issue[0] or issue
-
-    if issue.state is not active:
-      break
-
-    if turn_number >= max_turns:
-      break
-
-    turn_number = turn_number + 1
-
-  app_server.stop_session(session)
-  run_hook_best_effort("after_run", workspace.path)
-
-  exit_normal()
 ```
 
 ### 16.6 Worker Exit and Retry Handling
 
 ```text
-on_worker_exit(issue_id, reason, state):
+on_worker_exit(issue_id, reason, capability_failure, state):
   running_entry = state.running.remove(issue_id)
   state = add_runtime_seconds_to_totals(state, running_entry)
 
@@ -1947,10 +2292,22 @@ on_worker_exit(issue_id, reason, state):
       identifier: running_entry.identifier,
       delay_type: continuation
     })
+  else if capability_failure is deterministic:
+    state.retry_attempts.remove(issue_id)
+    state.operator_holds[issue_id] = {
+      issue_id,
+      identifier: running_entry.identifier,
+      attempt: next_attempt_from(running_entry),
+      held_at_ms: now_ms(),
+      error: reason,
+      capability_failure
+    }
+    state.claimed.add(issue_id)
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
       identifier: running_entry.identifier,
-      error: format("worker exited: %reason")
+      error: format("worker exited: %reason"),
+      capability_failure
     })
 
   notify_observers()
@@ -1963,6 +2320,13 @@ on_retry_timer(issue_id, state):
   if missing:
     return state
 
+  validation = validate_dispatch_config()
+  if validation is not ok:
+    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+      identifier: retry_entry.identifier,
+      error: validation.error
+    })
+
   candidates = tracker.fetch_candidate_issues()
   if fetch failed:
     return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
@@ -1971,7 +2335,7 @@ on_retry_timer(issue_id, state):
     })
 
   issue = find_by_id(candidates, issue_id)
-  if issue is null:
+  if issue is null or not is_dispatch_eligible(issue, allow_own_claim=issue_id):
     state.claimed.remove(issue_id)
     return state
 
@@ -1982,6 +2346,31 @@ on_retry_timer(issue_id, state):
     })
 
   return dispatch_issue(issue, state, attempt=retry_entry.attempt)
+```
+
+```text
+on_explicit_hold_retry(issue_id, state):
+  hold = state.operator_holds[issue_id]
+  if hold is missing:
+    return state
+
+  validation = validate_dispatch_config()
+  if validation is not ok:
+    return state
+
+  refreshed = tracker.fetch_issue_states_by_ids([issue_id])
+  if refreshed failed:
+    return state  # preserve the selected hold
+
+  issue = refreshed[0]
+  if issue is missing or not is_dispatch_eligible(issue, allow_own_claim=issue_id):
+    return release_hold_and_claim(state, issue_id)
+
+  if no_available_slots(state):
+    return state
+
+  state.operator_holds.remove(issue_id)
+  return dispatch_issue(issue, state, attempt=hold.attempt)
 ```
 
 ## 17. Test and Validation Matrix
@@ -2012,6 +2401,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when optional values are missing
+- `capabilities.commands` defaults to an empty map and omitted workflows add no execution
+  dependency
+- Valid hook-only, agent-only, and dual-boundary command declarations are normalized
+- Unsafe executable names, unknown hooks, inactive declarations, and malformed probe argv fail
+  dispatch as `config_invalid`
 - `tracker.kind` validation enforces currently supported kind (`linear`)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
@@ -2023,7 +2417,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.2 Workspace Manager and Safety
 
-- Deterministic workspace path per issue identifier
+- Deterministic workspace path per stable workspace input (`issue.id` in the TypeScript
+  implementation)
 - Missing workspace directory is created
 - Existing workspace directory is reused
 - Existing non-directory path at workspace location is handled safely (replace or fail per
@@ -2031,9 +2426,19 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Optional workspace population/synchronization errors are surfaced
 - Temporary artifacts (`tmp`, `.elixir_ls`) are removed during prep
 - `after_create` hook runs only on new workspace creation
+- A newly created, still-empty workspace is removed when `after_create` command preflight fails;
+  retry recreates it and reruns `after_create`
+- The same empty-directory recovery applies to an ordinary `after_create` hook-body failure
+- The original typed `required_command_*` error and sanitized metadata survive `after_create`
+  recovery, including a failed empty-directory removal, and are never replaced by
+  `workspace_create_failed`
+- A pre-existing or populated workspace is never deleted by `after_create` failure recovery
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
+- Hook-shell launch rejection is reported as `hook_failed`, not `hook_timed_out`
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
+- A typed declared-command failure in `after_run` or `before_remove` is logged with sanitized
+  capability metadata but remains best-effort and does not create an operator hold
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 
@@ -2067,6 +2472,18 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
+- Deterministic required-command failures enter operator hold without a timer and suppress polling
+  redispatch
+- Transient required-command failures use normal exponential retry backoff
+- Explicit operator retry targets only the selected held issue
+- A tracker refresh failure during explicit operator retry preserves the selected hold unchanged
+- Tracker claim deferral applies whenever any pre-dispatch capability is declared
+- A locally reserved preflight consumes one worker slot and concurrent poll/retry requests cannot
+  duplicate it
+- Held terminal issues release and clean their workspace; held non-active or missing issues release
+  without cleanup; active held issues remain held without re-probing
+- Invalid config at retry time prevents dispatch, retry-time ineligibility releases only that
+  issue's claim, and an explicit held retry with no available slot preserves the selected hold
 
 ### 17.5 Coding-Agent App-Server Client
 
@@ -2082,6 +2499,20 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Stdout and stderr are handled separately; protocol JSON is parsed from stdout only
 - Non-JSON stderr lines are logged but do not crash parsing
 - Command/file-change approvals are handled according to the implementation's documented policy
+- Generic agent command probes use the same app-server instance, cwd, environment, and prepared
+  sandbox as the later turn
+- The app-server is stopped when any generic command preflight, GitHub capability preflight, tracker
+  claim, prompt build, or agent turn fails after initialization
+- A combined generic-agent and GitHub `gh_auth_token` workflow resolves the credential environment
+  before starting the shared app-server, then runs both probes before tracker claim and turn start
+- Hook-boundary success is not accepted as agent-boundary proof, or vice versa
+- Hook marker recognition requires the invocation nonce, a matching declaration, the matching
+  deterministic exit status, and absence of the owned success marker; hook-authored marker-like text
+  cannot spoof a capability result
+- Not-found, execution-denied, and transient outcomes are exercised independently in both hook and
+  agent boundaries; a failed hook preflight proves that the workflow hook body did not run
+- Windows extensionless executable names resolve to `.exe` for the agent argv and use the Windows
+  command timeout
 - Unsupported dynamic tool calls are rejected without stalling the session
 - User input requests are handled according to the implementation's documented policy and do not
   stall indefinitely
@@ -2101,6 +2532,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 - Validation failures are operator-visible
 - Structured logging includes issue/session context fields
+- Required-command failures expose only stable sanitized code/capability/command/boundary/remediation
+  fields in logs and hold snapshots; raw PATH, probe output, hook output, argv, and credentials are
+  absent
 - Logging sink failures do not crash orchestration
 - Token/rate-limit aggregation remains correct across repeated agent updates
 - If a human-readable status surface is implemented, it is driven from orchestrator state and does
@@ -2161,8 +2595,15 @@ Use the same validation profiles as Section 17:
 
 ### 18.2 Recommended Extensions (Not Required for Conformance)
 
+This TypeScript implementation elects the declared external-command capability extension below, so
+its extension-conformance requirements are mandatory for this repository even though workflows
+that omit it retain no new runtime dependency.
+
 - Optional HTTP server honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
+- Optional declared external-command capabilities implement boundary-scoped hook and agent probes,
+  deterministic operator holds, transient backoff, sanitized diagnostics, and empty-workspace
+  recovery as defined in Sections 5.3.7, 9, 10.7, and 14.
 - Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.

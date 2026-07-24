@@ -10,7 +10,10 @@ import {
   DEFAULT_OBSERVABILITY_RENDER_INTERVAL_MS,
 } from "../config/defaults.js";
 import { ERROR_CODES } from "../errors/codes.js";
-import type { RuntimeSnapshot } from "../logging/runtime-snapshot.js";
+import type {
+  RuntimeSnapshot,
+  RuntimeSnapshotCapabilityFailure,
+} from "../logging/runtime-snapshot.js";
 import { toErrorMessage } from "./dashboard-format.js";
 import {
   isSnapshotTimeoutError,
@@ -47,12 +50,14 @@ export interface IssueDetailRetryState {
   attempt: number;
   due_at: string;
   error: string | null;
+  capability_failure?: RuntimeSnapshotCapabilityFailure;
 }
 
 export interface IssueDetailHoldState {
   attempt: number;
   held_at: string;
   error: string;
+  capability_failure?: RuntimeSnapshotCapabilityFailure;
 }
 
 export interface IssueDetailResponse {

@@ -1,14 +1,38 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import process from "node:process";
 import readline from "node:readline";
 
 const scenario = process.argv[2] ?? "happy";
+const scenarioArgument = process.argv[3];
+const shutdownEvidencePath = process.argv[4];
 const requests = [];
 let turnCount = 0;
+
+if (scenario === "ignore-sigterm") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 10_000);
+}
+
+if (scenario === "record-start") {
+  if (scenarioArgument === undefined) {
+    throw new Error("record-start scenario requires an output path");
+  }
+  writeFileSync(scenarioArgument, "started\n", "utf8");
+}
 
 const rl = readline.createInterface({
   input: process.stdin,
   crlfDelay: Number.POSITIVE_INFINITY,
+});
+
+rl.on("close", () => {
+  if (shutdownEvidencePath !== undefined) {
+    writeFileSync(
+      shutdownEvidencePath,
+      `${JSON.stringify(requests.map((request) => request.method))}\n`,
+      "utf8",
+    );
+  }
 });
 
 rl.on("line", async (line) => {
@@ -36,11 +60,16 @@ async function handleMessage(message) {
   }
 
   if (
-    scenario === "command-401" &&
+    [
+      "command-401",
+      "external-command-not-found",
+      "external-command-denied",
+      "external-command-transient",
+    ].includes(scenario) &&
     (message.method === "thread/start" || message.method === "turn/start")
   ) {
     throw new Error(
-      "HTTP 401 preflight must stop before thread/start or turn/start",
+      "failed capability preflight must stop before thread/start or turn/start",
     );
   }
 
@@ -167,11 +196,6 @@ async function handleMessage(message) {
       "command/exec must not override the inherited environment",
     );
     assertEqual(
-      process.env.GH_TOKEN,
-      "inherited-secret",
-      "command/exec must inherit the app-server credential environment",
-    );
-    assertEqual(
       message.params.sandboxPolicy?.type,
       "workspaceWrite",
       "command/exec must use the prepared turn sandbox policy",
@@ -183,6 +207,11 @@ async function handleMessage(message) {
     );
 
     if (scenario === "command-401") {
+      assertEqual(
+        process.env.GH_TOKEN,
+        "inherited-secret",
+        "GitHub command/exec must inherit the app-server credential environment",
+      );
       writeJson({
         id: message.id,
         result: {
@@ -195,6 +224,69 @@ async function handleMessage(message) {
     }
 
     const command = message.params.command;
+    if (
+      [
+        "external-command-success",
+        "external-command-not-found",
+        "external-command-denied",
+        "external-command-transient",
+      ].includes(scenario)
+    ) {
+      const expectedCommand =
+        process.platform === "win32" &&
+        scenarioArgument !== undefined &&
+        !scenarioArgument.includes(".")
+          ? `${scenarioArgument}.exe`
+          : scenarioArgument;
+      assertEqual(
+        command?.[0],
+        expectedCommand,
+        "generic command/exec must use the declared executable basename",
+      );
+      assertEqual(
+        command?.[1],
+        "--version",
+        "generic command/exec must append declared probe arguments",
+      );
+      assertEqual(
+        process.env.SYMPHONY_TEST_CREDENTIAL,
+        "inherited-secret",
+        "generic command/exec must inherit the app-server environment",
+      );
+      writeJson({
+        id: message.id,
+        result:
+          scenario === "external-command-success"
+            ? { exitCode: 0, stdout: "test tool 1.0\n", stderr: "" }
+            : scenario === "external-command-not-found"
+              ? {
+                  exitCode: 127,
+                  stdout: "",
+                  stderr:
+                    "raw missing output C:\\private\\tools token=fixture-secret",
+                }
+              : scenario === "external-command-denied"
+                ? {
+                    exitCode: 1,
+                    stdout: "",
+                    stderr:
+                      "raw denied output C:\\private\\tools token=fixture-secret: permission denied",
+                  }
+                : {
+                    exitCode: 75,
+                    stdout: "",
+                    stderr:
+                      "raw transient output C:\\private\\tools token=fixture-secret: try again later",
+                  },
+      });
+      return;
+    }
+
+    assertEqual(
+      process.env.GH_TOKEN,
+      "inherited-secret",
+      "GitHub command/exec must inherit the app-server credential environment",
+    );
     let stdout = "";
     if (
       command?.[0] === "gh" &&
