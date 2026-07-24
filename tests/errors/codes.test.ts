@@ -44,6 +44,7 @@ describe("ERROR_CODES", () => {
     expect(ERROR_CODES.codexTurnTimeout).toBe("codex_turn_timeout");
     expect(ERROR_CODES.githubCliNotFound).toBe("github_cli_not_found");
     expect(ERROR_CODES.githubAuthInvalid).toBe("github_auth_invalid");
+    expect(ERROR_CODES.githubRemoteMissing).toBe("github_remote_missing");
     expect(ERROR_CODES.githubPermissionDenied).toBe("github_permission_denied");
     expect(ERROR_CODES.githubCapabilityTransient).toBe(
       "github_capability_transient",

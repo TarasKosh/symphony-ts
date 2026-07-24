@@ -5,6 +5,10 @@ import {
   GITHUB_CAPABILITY_OUTPUT_BYTES_CAP,
   GithubCapabilityError,
 } from "./github-capability.js";
+import {
+  appendGithubDiagnostic,
+  boundedGithubDiagnosticSource,
+} from "./github-diagnostic.js";
 
 const GITHUB_HOSTNAME = "github.com";
 export const GITHUB_CREDENTIAL_LOAD_TIMEOUT_MS = 15_000;
@@ -30,6 +34,8 @@ export interface GithubCredentialCommandResult {
   stdout: string;
   stderr: string;
   errorCode: string | null;
+  errorPath: string | null;
+  errorSyscall: string | null;
 }
 
 export interface GithubCredentialCommandRunner {
@@ -58,25 +64,31 @@ export class GhAuthTokenCredentialProvider implements GithubCredentialProvider {
         outputBytesCap: GITHUB_CAPABILITY_OUTPUT_BYTES_CAP,
       });
     } catch (error) {
-      if (isMissingExecutableError(error)) {
-        throw launchEnvironmentMissingExecutableFailure();
+      const diagnostic = error instanceof Error ? error.message : undefined;
+      if (isCorrelatedGhEnoent(error)) {
+        throw launchEnvironmentMissingExecutableFailure(diagnostic);
       }
-      throw credentialLoadTransientFailure();
+      throw credentialLoadTransientFailure(diagnostic);
     }
 
     if (result.exitCode !== 0) {
-      if (result.errorCode === "ENOENT") {
-        throw launchEnvironmentMissingExecutableFailure();
+      const diagnostic = boundedGithubDiagnosticSource(result.stderr);
+      if (
+        result.exitCode === 127 ||
+        (result.errorCode === "ENOENT" &&
+          isGhSpawn(result.errorPath, result.errorSyscall))
+      ) {
+        throw launchEnvironmentMissingExecutableFailure(diagnostic);
       }
-      if (isAuthenticationDiagnostic(result.stderr)) {
-        throw authenticationFailure();
+      if (isAuthenticationDiagnostic(diagnostic)) {
+        throw authenticationFailure(diagnostic);
       }
-      throw credentialLoadTransientFailure();
+      throw credentialLoadTransientFailure(diagnostic);
     }
 
     const token = result.stdout.trim();
     if (token.length === 0) {
-      throw authenticationFailure();
+      throw authenticationFailure(result.stderr);
     }
 
     return token;
@@ -115,6 +127,8 @@ class NodeGithubCredentialCommandRunner
               error !== null && typeof error.code === "string"
                 ? error.code
                 : null,
+            errorPath: readStringProperty(error, "path"),
+            errorSyscall: readStringProperty(error, "syscall"),
           });
         },
       );
@@ -123,43 +137,85 @@ class NodeGithubCredentialCommandRunner
 }
 
 function isAuthenticationDiagnostic(diagnostic: string): boolean {
-  return /not logged in|not logged into any github hosts|no (?:oauth|authentication) token|authentication failed|gh auth login/i.test(
-    diagnostic,
-  );
-}
-
-function isMissingExecutableError(error: unknown): boolean {
   return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    error.code === "ENOENT"
+    /\bHTTP(?:\/[0-9.]+)?\s+401\b|\bstatus(?:\s+code)?(?:\s*[:=]\s*|\s+)401\b/i.test(
+      diagnostic,
+    ) ||
+    /\b(?:bad credentials|not logged in(?:to)?|not authenticated|authentication failed|requires authentication)\b/i.test(
+      diagnostic,
+    )
   );
 }
 
-function launchEnvironmentMissingExecutableFailure(): GithubCapabilityError {
+function isCorrelatedGhEnoent(error: unknown): boolean {
+  return (
+    readStringProperty(error, "code") === "ENOENT" &&
+    isGhSpawn(
+      readStringProperty(error, "path"),
+      readStringProperty(error, "syscall"),
+    )
+  );
+}
+
+function isGhSpawn(
+  errorPath: string | null,
+  errorSyscall: string | null,
+): boolean {
+  const hasPath = errorPath !== null && errorPath.length > 0;
+  const hasSyscall = errorSyscall !== null && errorSyscall.length > 0;
+  if (!hasPath && !hasSyscall) {
+    return false;
+  }
+
+  const pathMatches =
+    !hasPath || /^gh(?:\.exe)?$/i.test(errorPath.split(/[\\/]/).at(-1) ?? "");
+  const syscallMatches =
+    !hasSyscall || /^spawn(?:file)?\s+gh(?:\.exe)?$/i.test(errorSyscall.trim());
+  return pathMatches && syscallMatches;
+}
+
+function readStringProperty(value: unknown, property: string): string | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const candidate = (value as Record<string, unknown>)[property];
+  return typeof candidate === "string" ? candidate : null;
+}
+
+function launchEnvironmentMissingExecutableFailure(
+  diagnostic?: string,
+): GithubCapabilityError {
   return new GithubCapabilityError({
     code: ERROR_CODES.githubCliNotFound,
-    message:
+    message: appendGithubDiagnostic(
       "Required GitHub capability is unavailable: gh was not found in the Symphony launch environment.",
+      diagnostic,
+    ),
     deterministic: true,
   });
 }
 
-function authenticationFailure(): GithubCapabilityError {
+function authenticationFailure(diagnostic?: string): GithubCapabilityError {
   return new GithubCapabilityError({
     code: ERROR_CODES.githubAuthInvalid,
-    message:
+    message: appendGithubDiagnostic(
       "Required GitHub capability failed: gh authentication is invalid or expired.",
+      diagnostic,
+    ),
     deterministic: true,
   });
 }
 
-function credentialLoadTransientFailure(): GithubCapabilityError {
+function credentialLoadTransientFailure(
+  diagnostic?: string,
+): GithubCapabilityError {
   return new GithubCapabilityError({
     code: ERROR_CODES.githubCapabilityTransient,
-    message:
+    message: appendGithubDiagnostic(
       "Required GitHub credential could not be loaded from gh auth token due to a transient local CLI failure.",
+      diagnostic,
+    ),
     deterministic: false,
   });
 }

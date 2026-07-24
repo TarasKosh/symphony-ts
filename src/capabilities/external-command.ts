@@ -312,6 +312,7 @@ export function isDeterministicCapabilityErrorCode(
     code === ERROR_CODES.requiredCommandNotFound ||
     code === ERROR_CODES.requiredCommandExecutionDenied ||
     code === ERROR_CODES.githubCliNotFound ||
+    code === ERROR_CODES.githubRemoteMissing ||
     code === ERROR_CODES.githubAuthInvalid ||
     code === ERROR_CODES.githubPermissionDenied
   );
