@@ -222,6 +222,68 @@ describe("dashboard server", () => {
     expect(invalidMethod.headers.allow).toBe("POST");
   });
 
+  it("serves sanitized command capability metadata for operator holds", async () => {
+    const remediation =
+      "Install rg in the agent execution environment, then explicitly retry the held issue.";
+    const snapshot: RuntimeSnapshot = {
+      ...createSnapshot(),
+      counts: {
+        running: 1,
+        retrying: 1,
+        held: 1,
+      },
+      holds: [
+        {
+          issue_id: "issue-4",
+          issue_identifier: "HOLD-4",
+          attempt: 1,
+          held_at: "2026-03-06T10:00:01.000Z",
+          error:
+            "required_command_not_found: required command rg is unavailable at agent",
+          capability_failure: {
+            code: "required_command_not_found",
+            capability: "external_command",
+            command: "rg",
+            boundary: "agent",
+            remediation,
+          },
+        },
+      ],
+    };
+    const server = await startDashboardServer({
+      port: 0,
+      host: createHost({
+        getRuntimeSnapshot: () => snapshot,
+      }),
+    });
+    servers.push(server);
+
+    const state = await sendRequest(server.port, {
+      method: "GET",
+      path: "/api/v1/state",
+    });
+
+    expect(state.statusCode).toBe(200);
+    expect(JSON.parse(state.body)).toMatchObject({
+      holds: [
+        {
+          issue_identifier: "HOLD-4",
+          capability_failure: {
+            code: "required_command_not_found",
+            capability: "external_command",
+            command: "rg",
+            boundary: "agent",
+            remediation,
+          },
+        },
+      ],
+    });
+    expect(state.body).not.toContain("PATH=");
+    expect(state.body).not.toContain("Authorization");
+    expect(state.body).not.toContain("secret-token");
+    expect(state.body).not.toContain("probe stdout");
+  });
+
   it("returns snapshot_unavailable when the host snapshot fails", async () => {
     const server = createDashboardServer({
       host: createHost({

@@ -84,6 +84,7 @@ describe("domain model", () => {
     expect(state.running).toEqual({});
     expect([...state.claimed]).toEqual([]);
     expect(state.retryAttempts).toEqual({});
+    expect(state.operatorHolds).toEqual({});
     expect([...state.completed]).toEqual([]);
     expect(state.progressSignatures).toEqual({});
     expect(state.codexTotals).toEqual({

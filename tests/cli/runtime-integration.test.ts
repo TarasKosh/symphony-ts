@@ -461,6 +461,99 @@ Implement {{ issue.identifier }} attempt={{ attempt }}
     expect(tracker.fetchCandidateIssues).toHaveBeenCalled();
     expect(tracker.fetchIssueStatesByIds).toHaveBeenCalled();
   });
+
+  it("holds an issue for a missing hook command before the hook body, app-server, claim, or turn starts", async () => {
+    const root = await createTempDir("symphony-task10-missing-hook-");
+    const logsRoot = join(root, "logs");
+    const workspaceRoot = join(root, "workspaces");
+    const workflowPath = join(root, "WORKFLOW.md");
+    const appServerMarker = join(root, "app-server-started.txt");
+    const missingCommand = "symphony-command-that-does-not-exist";
+    await writeFile(
+      workflowPath,
+      `---
+tracker:
+  kind: linear
+  api_key: token
+  project_slug: ENG
+polling:
+  interval_ms: 25
+workspace:
+  root: ${workspaceRoot}
+hooks:
+  before_run: printf should-not-run > hook-body-ran.txt
+capabilities:
+  commands:
+    ${missingCommand}:
+      hooks: [before_run]
+      agent: false
+      probe_args: []
+codex:
+  command: node "${codexFixturePath}" record-start "${appServerMarker}"
+  approval_policy: full-auto
+  thread_sandbox: workspace-write
+  turn_sandbox_policy:
+    type: workspace-write
+  turn_timeout_ms: 2000
+  read_timeout_ms: 500
+  stall_timeout_ms: 2000
+server:
+  port: 0
+---
+Implement {{ issue.identifier }}
+`,
+      "utf8",
+    );
+    const tracker = new MissingHookCommandTracker();
+    const config = await resolveRuntimeConfig(workflowPath);
+    const service = await startRuntimeService({
+      config,
+      logsRoot,
+      tracker,
+      stdout: new PassThrough(),
+    });
+
+    try {
+      await vi.waitFor(
+        async () => {
+          const state = await service.runtimeHost.getRuntimeSnapshot();
+          expect(state.counts.running).toBe(0);
+          expect(state.counts.retrying).toBe(0);
+          expect(state.counts.held).toBe(1);
+          expect(state.holds[0]).toMatchObject({
+            issue_id: "issue-missing-hook",
+            issue_identifier: "MISSING-HOOK-1",
+            capability_failure: {
+              code: "required_command_not_found",
+              capability: "external_command",
+              command: missingCommand,
+              boundary: "hook:before_run",
+            },
+          });
+        },
+        { timeout: 10_000 },
+      );
+
+      await expect(
+        stat(join(workspaceRoot, "issue-missing-hook")),
+      ).resolves.toBeDefined();
+      await expect(
+        stat(join(workspaceRoot, "issue-missing-hook", "hook-body-ran.txt")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(appServerMarker)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(tracker.claimIssue).not.toHaveBeenCalled();
+    } finally {
+      await service.shutdown();
+    }
+
+    const logFile = await readFile(join(logsRoot, "symphony.jsonl"), "utf8");
+    expect(logFile).toContain('"error_code":"required_command_not_found"');
+    expect(logFile).toContain(`"command":"${missingCommand}"`);
+    expect(logFile).toContain('"boundary":"hook:before_run"');
+    expect(logFile).not.toContain("hook-body-ran");
+  }, 15_000);
 });
 
 function createTracker(input?: {
@@ -537,6 +630,35 @@ class EndToEndTracker implements IssueTracker {
   private completed = false;
 }
 
+class MissingHookCommandTracker implements IssueTracker {
+  readonly issue = createIssue({
+    id: "issue-missing-hook",
+    identifier: "MISSING-HOOK-1",
+    state: "Todo",
+    description: "Verify missing hook command capability handling.",
+  });
+
+  readonly fetchCandidateIssues = vi.fn(async () => [this.issue]);
+
+  readonly fetchIssuesByStates = vi.fn(async () => []);
+
+  readonly fetchIssueStatesByIds = vi.fn(async (issueIds: string[]) =>
+    issueIds.includes(this.issue.id)
+      ? [
+          {
+            id: this.issue.id,
+            identifier: this.issue.identifier,
+            state: this.issue.state,
+          },
+        ]
+      : [],
+  );
+
+  readonly claimIssue = vi.fn();
+
+  readonly handoffIssue = vi.fn();
+}
+
 class ThrowingRuntimeHost extends OrchestratorRuntimeHost {
   override async pollOnce(): Promise<PollTickResult> {
     throw new Error("poll exploded");
@@ -609,6 +731,7 @@ function createConfig(
       stallTimeoutMs: 300_000,
     },
     capabilities: {
+      commands: {},
       github: {
         required: false,
         credentialSource: "environment",

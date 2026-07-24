@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,8 @@ import {
   AgentRunner,
   type AgentRunnerCodexClientFactoryInput,
   type AgentRunnerError,
+  type ExternalCommandProbe,
+  type GithubCapabilityProbe,
   WorkspaceHookError,
 } from "../../src/index.js";
 import type {
@@ -223,6 +225,516 @@ describe("AgentRunner", () => {
     expect(startSession).toHaveBeenCalledTimes(1);
   });
 
+  it("stops before app-server creation, tracker claim, and turn start when a fatal hook command preflight fails", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    setCommandCapabilities(config, {
+      rg: {
+        hooks: ["beforeRun"],
+        agent: false,
+        probeArgs: [],
+      },
+    });
+    const remediation =
+      "Install rg in the hook execution environment, then explicitly retry the held issue.";
+    const hookFailure = Object.assign(
+      new Error("Required command rg is unavailable at hook:before_run."),
+      {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "hook:before_run",
+        remediation,
+        capabilityFailure: {
+          code: ERROR_CODES.requiredCommandNotFound,
+          capability: "external_command",
+          command: "rg",
+          boundary: "hook:before_run",
+          remediation,
+        },
+      },
+    );
+    const hooks = {
+      run: vi.fn(async ({ name }: { name: string }) => {
+        if (name === "beforeRun") {
+          throw hookFailure;
+        }
+        return false;
+      }),
+      runBestEffort: vi.fn().mockResolvedValue(false),
+    };
+    const claimIssue = vi.fn();
+    const startSession = vi.fn(async () => completedTurn());
+    const createCodexClient = vi.fn((input) =>
+      createStubCodexClient([], input, { startSession }),
+    );
+    const externalCommandCapabilityProbe = {
+      probe: vi.fn().mockRejectedValue(new Error("must not run")),
+    };
+    const runner = new AgentRunner({
+      config,
+      tracker: {
+        ...createTracker(),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      },
+      hooks: hooks as never,
+      createCodexClient,
+      externalCommandCapabilityProbe,
+    });
+
+    await expect(
+      runner.run({
+        issue: { ...ISSUE_FIXTURE, state: "Todo" },
+        attempt: null,
+      }),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.requiredCommandNotFound,
+      capability: "external_command",
+      capabilityFailure: {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command: "rg",
+        boundary: "hook:before_run",
+        remediation,
+      },
+      failedPhase: "preparing_workspace",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(createCodexClient).not.toHaveBeenCalled();
+    expect(externalCommandCapabilityProbe.probe).not.toHaveBeenCalled();
+    expect(claimIssue).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
+  it("runs an agent command probe through the same app-server environment, cwd, and prepared sandbox", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    setCommandCapabilities(config, {
+      rg: {
+        hooks: [],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    });
+    const environment: NodeJS.ProcessEnv = {
+      PATH: "C:\\test-tools",
+      SYMPHONY_TEST_CREDENTIAL: "inherited-secret",
+    };
+    const externalCommandCapabilityProbe = {
+      probe: vi.fn().mockResolvedValue({
+        command: "rg",
+        boundary: "agent",
+      }),
+    };
+    let client: ReturnType<typeof createStubCodexClient> | undefined;
+    const createCodexClient = vi.fn((input) => {
+      client = createStubCodexClient([], input, {
+        statuses: ["completed"],
+      });
+      return client;
+    });
+    const runner = new AgentRunner({
+      config,
+      tracker: createTracker({
+        refreshStates: [
+          { id: "issue-1", identifier: "ABC-123", state: "Done" },
+        ],
+      }),
+      environment,
+      createCodexClient,
+      externalCommandCapabilityProbe,
+    });
+
+    await runner.run({ issue: ISSUE_FIXTURE, attempt: null });
+
+    expect(createCodexClient).toHaveBeenCalledTimes(1);
+    expect(externalCommandCapabilityProbe.probe).toHaveBeenCalledTimes(1);
+    const clientInput = createCodexClient.mock.calls[0]?.[0];
+    const probeInput = externalCommandCapabilityProbe.probe.mock.calls[0]?.[0];
+    expect(clientInput.environment).toEqual(environment);
+    expect(clientInput.cwd).toBe(join(root, "issue-1"));
+    expect(probeInput).toMatchObject({
+      command: "rg",
+      probeArgs: ["--version"],
+      workspacePath: clientInput.cwd,
+    });
+    expect(probeInput.sandboxPolicy).toBe(clientInput.turnSandboxPolicy);
+    expect(probeInput.executor).toBe(client);
+  });
+
+  it("closes the shared app-server when an agent command preflight fails after a successful hook", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    setCommandCapabilities(config, {
+      rg: {
+        hooks: ["beforeRun"],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    });
+    const hooks = {
+      run: vi.fn().mockResolvedValue(true),
+      runBestEffort: vi.fn().mockResolvedValue(false),
+    };
+    const close = vi.fn().mockResolvedValue(undefined);
+    const startSession = vi.fn(async () => completedTurn());
+    const clientFactory = vi.fn((input) =>
+      createStubCodexClient([], input, { close, startSession }),
+    );
+    const capabilityFailure = {
+      code: ERROR_CODES.requiredCommandNotFound,
+      capability: "external_command",
+      command: "rg",
+      boundary: "agent",
+      remediation:
+        "Install rg in the agent execution environment, then explicitly retry the held issue.",
+    } as const;
+    const externalCommandCapabilityProbe = {
+      probe: vi
+        .fn()
+        .mockRejectedValue(
+          Object.assign(
+            new Error("Required command rg is unavailable at agent."),
+            capabilityFailure,
+            { capabilityFailure },
+          ),
+        ),
+    };
+    const claimIssue = vi.fn();
+    const runner = new AgentRunner({
+      config,
+      tracker: {
+        ...createTracker(),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      },
+      hooks: hooks as never,
+      createCodexClient: clientFactory,
+      externalCommandCapabilityProbe,
+    });
+
+    await expect(
+      runner.run({
+        issue: { ...ISSUE_FIXTURE, state: "Todo" },
+        attempt: null,
+      }),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.requiredCommandNotFound,
+      capabilityFailure,
+      failedPhase: "validating_capabilities",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(hooks.run).toHaveBeenCalledWith({
+      name: "beforeRun",
+      workspacePath: join(root, "issue-1"),
+    });
+    expect(externalCommandCapabilityProbe.probe).toHaveBeenCalledTimes(1);
+    expect(claimIssue).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the early shared app-server when the GitHub capability probe fails", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    config.capabilities.github.required = true;
+    const close = vi.fn().mockResolvedValue(undefined);
+    const startSession = vi.fn(async () => completedTurn());
+    const createCodexClient = vi.fn((input) =>
+      createStubCodexClient([], input, { close, startSession }),
+    );
+    const runner = new AgentRunner({
+      config,
+      tracker: createTracker(),
+      environment: {
+        PATH: "C:\\test-tools",
+        GH_TOKEN: "explicit-secret",
+      },
+      githubCapabilityProbe: {
+        probe: vi.fn().mockRejectedValue(
+          Object.assign(new Error("GitHub credentials are invalid."), {
+            code: ERROR_CODES.githubAuthInvalid,
+            capability: "github",
+          }),
+        ),
+      },
+      createCodexClient,
+    });
+
+    await expect(
+      runner.run({ issue: ISSUE_FIXTURE, attempt: null }),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.githubAuthInvalid,
+      failedPhase: "validating_capabilities",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(createCodexClient).toHaveBeenCalledTimes(1);
+    expect(startSession).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the early shared app-server when tracker claim fails after command preflight", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    enableAgentCommand(config);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const startSession = vi.fn(async () => completedTurn());
+    const createCodexClient = vi.fn((input) =>
+      createStubCodexClient([], input, { close, startSession }),
+    );
+    const claimIssue = vi.fn().mockRejectedValue(new Error("claim failed"));
+    const runner = new AgentRunner({
+      config,
+      tracker: {
+        ...createTracker(),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      },
+      externalCommandCapabilityProbe: {
+        probe: vi.fn().mockResolvedValue({
+          command: "rg",
+          boundary: "agent",
+        }),
+      },
+      createCodexClient,
+    });
+
+    await expect(
+      runner.run({
+        issue: { ...ISSUE_FIXTURE, state: "Todo" },
+        attempt: null,
+      }),
+    ).rejects.toMatchObject({
+      message: "claim failed",
+      failedPhase: "validating_capabilities",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(claimIssue).toHaveBeenCalledTimes(1);
+    expect(startSession).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the early shared app-server when prompt construction fails", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    config.promptTemplate = "{% if %}";
+    enableAgentCommand(config);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const startSession = vi.fn(async () => completedTurn());
+    const createCodexClient = vi.fn((input) =>
+      createStubCodexClient([], input, { close, startSession }),
+    );
+    const runner = new AgentRunner({
+      config,
+      tracker: createTracker(),
+      externalCommandCapabilityProbe: {
+        probe: vi.fn().mockResolvedValue({
+          command: "rg",
+          boundary: "agent",
+        }),
+      },
+      createCodexClient,
+    });
+
+    await expect(
+      runner.run({ issue: ISSUE_FIXTURE, attempt: null }),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.templateParseError,
+      failedPhase: "building_prompt",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(startSession).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the early shared app-server when the first turn fails", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    enableAgentCommand(config);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const startSession = vi.fn().mockRejectedValue(new Error("turn failed"));
+    const createCodexClient = vi.fn((input) =>
+      createStubCodexClient([], input, { close, startSession }),
+    );
+    const runner = new AgentRunner({
+      config,
+      tracker: createTracker(),
+      externalCommandCapabilityProbe: {
+        probe: vi.fn().mockResolvedValue({
+          command: "rg",
+          boundary: "agent",
+        }),
+      },
+      createCodexClient,
+    });
+
+    await expect(
+      runner.run({ issue: ISSUE_FIXTURE, attempt: null }),
+    ).rejects.toMatchObject({
+      message: "turn failed",
+      failedPhase: "initializing_session",
+    } satisfies Partial<AgentRunnerError>);
+
+    expect(startSession).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs generic and GitHub probes with bridged credentials before tracker claim and turn start", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    config.capabilities.github.required = true;
+    config.capabilities.github.credentialSource = "gh_auth_token";
+    setCommandCapabilities(config, {
+      rg: {
+        hooks: [],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    });
+    const order: string[] = [];
+    const externalCommandCapabilityProbe = {
+      probe: vi.fn(
+        async (_input: Parameters<ExternalCommandProbe["probe"]>[0]) => {
+          order.push("generic_probe");
+          return { command: "rg", boundary: "agent" as const };
+        },
+      ),
+    };
+    const githubCapabilityProbe = {
+      probe: vi.fn(
+        async (_input: Parameters<GithubCapabilityProbe["probe"]>[0]) => {
+          order.push("github_probe");
+          return {
+            identity: "octocat",
+            repository: "example/project",
+            canPush: true as const,
+          };
+        },
+      ),
+    };
+    const claimIssue = vi.fn(async () => {
+      order.push("claim");
+      return {
+        issue: {
+          id: "issue-1",
+          identifier: "ABC-123",
+          state: "In Progress",
+        },
+        state: "In Progress",
+      };
+    });
+    const getToken = vi.fn().mockResolvedValue("keyring-secret");
+    let client: ReturnType<typeof createStubCodexClient> | undefined;
+    const createCodexClient = vi.fn((input) => {
+      order.push("create_client");
+      client = createStubCodexClient([], input, {
+        startSession: async () => {
+          order.push("turn");
+          return completedTurn();
+        },
+      });
+      return client;
+    });
+    const runner = new AgentRunner({
+      config,
+      tracker: {
+        ...createTracker({
+          refreshStates: [
+            { id: "issue-1", identifier: "ABC-123", state: "Done" },
+          ],
+        }),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      },
+      environment: {
+        PATH: "C:\\test-tools",
+        GH_TOKEN: " ",
+      },
+      githubCredentialProvider: { getToken },
+      githubCapabilityProbe,
+      externalCommandCapabilityProbe,
+      createCodexClient,
+    });
+
+    await runner.run({
+      issue: { ...ISSUE_FIXTURE, state: "Todo" },
+      attempt: null,
+    });
+
+    const genericProbeIndex = order.indexOf("generic_probe");
+    const githubProbeIndex = order.indexOf("github_probe");
+    const claimIndex = order.indexOf("claim");
+    const turnIndex = order.indexOf("turn");
+    expect(genericProbeIndex).toBeGreaterThan(order.indexOf("create_client"));
+    expect(githubProbeIndex).toBeGreaterThan(order.indexOf("create_client"));
+    expect(genericProbeIndex).toBeLessThan(claimIndex);
+    expect(githubProbeIndex).toBeLessThan(claimIndex);
+    expect(claimIndex).toBeLessThan(turnIndex);
+    expect(createCodexClient.mock.calls[0]?.[0].environment).toEqual({
+      PATH: "C:\\test-tools",
+      GH_TOKEN: "keyring-secret",
+    });
+    expect(
+      externalCommandCapabilityProbe.probe.mock.calls[0]?.[0].executor,
+    ).toBe(client);
+    expect(githubCapabilityProbe.probe.mock.calls[0]?.[0].executor).toBe(
+      client,
+    );
+  });
+
+  it("keeps the no-command path claim-first with no probe or early app-server startup", async () => {
+    const root = await createRoot();
+    const config = createConfig(root, "unused");
+    setCommandCapabilities(config, {});
+    const order: string[] = [];
+    const claimIssue = vi.fn(async () => {
+      order.push("claim");
+      return {
+        issue: {
+          id: "issue-1",
+          identifier: "ABC-123",
+          state: "In Progress",
+        },
+        state: "In Progress",
+      };
+    });
+    const externalCommandCapabilityProbe = {
+      probe: vi.fn().mockRejectedValue(new Error("must not run")),
+    };
+    const createCodexClient = vi.fn((input) => {
+      order.push("create_client");
+      return createStubCodexClient([], input, {
+        startSession: async () => {
+          order.push("turn");
+          return completedTurn();
+        },
+      });
+    });
+    const runner = new AgentRunner({
+      config,
+      tracker: {
+        ...createTracker({
+          refreshStates: [
+            { id: "issue-1", identifier: "ABC-123", state: "Done" },
+          ],
+        }),
+        claimIssue,
+        handoffIssue: vi.fn(),
+      },
+      externalCommandCapabilityProbe,
+      createCodexClient,
+    });
+
+    await runner.run({
+      issue: { ...ISSUE_FIXTURE, state: "Todo" },
+      attempt: null,
+    });
+
+    expect(order).toEqual(["claim", "create_client", "turn"]);
+    expect(externalCommandCapabilityProbe.probe).not.toHaveBeenCalled();
+  });
+
   it("allows turn/start after the same app-server command/exec GitHub probe succeeds", async () => {
     const root = await createRoot();
     const config = createConfig(root, "command-success");
@@ -245,6 +757,145 @@ describe("AgentRunner", () => {
     expect(result.turnsCompleted).toBe(1);
     expect(result.lastTurn?.status).toBe("completed");
   });
+
+  it("treats an agent-visible command as independently missing from the hook shell", async () => {
+    const root = await createRoot();
+    const command = "symphony-agent-only-fixture-command";
+    const agentOnlyConfig = createConfig(
+      root,
+      `external-command-success ${command}`,
+    );
+    setCommandCapabilities(agentOnlyConfig, {
+      [command]: {
+        hooks: [],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    });
+    const environment = {
+      ...process.env,
+      SYMPHONY_TEST_CREDENTIAL: "inherited-secret",
+    };
+    const agentOnlyRunner = new AgentRunner({
+      config: agentOnlyConfig,
+      tracker: createTracker({
+        refreshStates: [
+          { id: "issue-1", identifier: "ABC-123", state: "Done" },
+        ],
+      }),
+      environment,
+    });
+
+    const agentOnlyResult = await agentOnlyRunner.run({
+      issue: ISSUE_FIXTURE,
+      attempt: null,
+    });
+
+    expect(agentOnlyResult.lastTurn?.status).toBe("completed");
+
+    const dualBoundaryConfig = createConfig(
+      root,
+      `external-command-success ${command}`,
+    );
+    dualBoundaryConfig.hooks.timeoutMs = 5_000;
+    setCommandCapabilities(dualBoundaryConfig, {
+      [command]: {
+        hooks: ["beforeRun"],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    });
+    const dualBoundaryRunner = new AgentRunner({
+      config: dualBoundaryConfig,
+      tracker: createTracker(),
+      environment,
+    });
+
+    await expect(
+      dualBoundaryRunner.run({
+        issue: ISSUE_FIXTURE,
+        attempt: null,
+      }),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.requiredCommandNotFound,
+      capabilityFailure: {
+        code: ERROR_CODES.requiredCommandNotFound,
+        capability: "external_command",
+        command,
+        boundary: "hook:before_run",
+        remediation: expect.any(String),
+      },
+      failedPhase: "preparing_workspace",
+    } satisfies Partial<AgentRunnerError>);
+  });
+
+  it.each([
+    {
+      scenario: "external-command-not-found",
+      expectedCode: ERROR_CODES.requiredCommandNotFound,
+    },
+    {
+      scenario: "external-command-denied",
+      expectedCode: ERROR_CODES.requiredCommandExecutionDenied,
+    },
+    {
+      scenario: "external-command-transient",
+      expectedCode: ERROR_CODES.requiredCommandCapabilityTransient,
+    },
+  ])(
+    "classifies and sanitizes a %s agent command failure before a turn starts",
+    async ({ scenario, expectedCode }) => {
+      const root = await createRoot();
+      const shutdownEvidencePath = join(root, `${scenario}-shutdown.json`);
+      const config = createConfig(
+        root,
+        `${scenario} node ${toBashPath(shutdownEvidencePath)}`,
+      );
+      config.hooks.timeoutMs = 5_000;
+      setCommandCapabilities(config, {
+        node: {
+          hooks: ["beforeRun"],
+          agent: true,
+          probeArgs: ["--version"],
+        },
+      });
+      const runner = new AgentRunner({
+        config,
+        tracker: createTracker(),
+        environment: {
+          ...process.env,
+          SYMPHONY_TEST_CREDENTIAL: "inherited-secret",
+        },
+      });
+
+      const error = await runner
+        .run({ issue: ISSUE_FIXTURE, attempt: null })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        code: expectedCode,
+        capabilityFailure: {
+          code: expectedCode,
+          capability: "external_command",
+          command: "node",
+          boundary: "agent",
+          remediation: expect.any(String),
+        },
+        failedPhase: "validating_capabilities",
+      } satisfies Partial<AgentRunnerError>);
+      expect(JSON.stringify(error)).not.toContain("C:\\private\\tools");
+      expect(JSON.stringify(error)).not.toContain("fixture-secret");
+      await vi.waitFor(async () => {
+        const methods = JSON.parse(
+          await readFile(shutdownEvidencePath, "utf8"),
+        ) as string[];
+        expect(methods).toContain("initialize");
+        expect(methods).toContain("command/exec");
+        expect(methods).not.toContain("thread/start");
+        expect(methods).not.toContain("turn/start");
+      });
+    },
+  );
 
   it("bridges the current gh auth token into the worker environment only when opted in", async () => {
     const root = await createRoot();
@@ -1180,6 +1831,7 @@ function createConfig(root: string, scenario: string): ResolvedWorkflowConfig {
       stallTimeoutMs: 2_000,
     },
     capabilities: {
+      commands: {},
       github: {
         required: false,
         credentialSource: "environment",
@@ -1194,6 +1846,30 @@ function createConfig(root: string, scenario: string): ResolvedWorkflowConfig {
       renderIntervalMs: 16,
     },
   };
+}
+
+function setCommandCapabilities(
+  config: ResolvedWorkflowConfig,
+  commands: Record<
+    string,
+    {
+      hooks: Array<"afterCreate" | "beforeRun" | "afterRun" | "beforeRemove">;
+      agent: boolean;
+      probeArgs: string[];
+    }
+  >,
+): void {
+  config.capabilities.commands = commands;
+}
+
+function enableAgentCommand(config: ResolvedWorkflowConfig): void {
+  setCommandCapabilities(config, {
+    rg: {
+      hooks: [],
+      agent: true,
+      probeArgs: ["--version"],
+    },
+  });
 }
 
 function toBashPath(value: string): string {

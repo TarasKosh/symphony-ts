@@ -400,6 +400,24 @@ describe("CodexAppServerClient", () => {
 
     await client.close();
   });
+
+  it("shares one bounded shutdown when the app-server resists SIGTERM", async () => {
+    const workspace = await createWorkspace();
+    const client = createClient("ignore-sigterm", workspace, []);
+
+    await client.startSession({
+      prompt: "Complete before shutdown",
+      title: "ABC-123: Example",
+    });
+
+    const startedAt = Date.now();
+    const firstClose = client.close();
+    const secondClose = client.close();
+    await Promise.all([firstClose, secondClose]);
+
+    expect(Date.now() - startedAt).toBeLessThan(3_500);
+    await expect(client.close()).resolves.toBeUndefined();
+  }, 7_000);
 });
 
 function createClient(

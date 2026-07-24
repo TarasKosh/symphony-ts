@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_CODEX_COMMAND,
+  DEFAULT_COMMAND_CAPABILITIES,
   DEFAULT_GITHUB_CAPABILITY_REQUIRED,
   DEFAULT_GITHUB_CREDENTIAL_SOURCE,
   DEFAULT_HOOK_TIMEOUT_MS,
@@ -36,6 +37,7 @@ describe("SPEC_DEFAULTS", () => {
     expect(DEFAULT_OBSERVABILITY_REFRESH_MS).toBe(1_000);
     expect(DEFAULT_OBSERVABILITY_RENDER_INTERVAL_MS).toBe(16);
     expect(DEFAULT_CODEX_COMMAND).toBe("codex app-server");
+    expect(DEFAULT_COMMAND_CAPABILITIES).toEqual({});
     expect(DEFAULT_GITHUB_CAPABILITY_REQUIRED).toBe(false);
     expect(DEFAULT_GITHUB_CREDENTIAL_SOURCE).toBe("environment");
   });
@@ -53,6 +55,9 @@ describe("SPEC_DEFAULTS", () => {
       DEFAULT_MAX_CONCURRENT_AGENTS,
     );
     expect(SPEC_DEFAULTS.codex.command).toBe(DEFAULT_CODEX_COMMAND);
+    expect(SPEC_DEFAULTS.capabilities.commands).toBe(
+      DEFAULT_COMMAND_CAPABILITIES,
+    );
     expect(SPEC_DEFAULTS.capabilities.github.required).toBe(false);
     expect(SPEC_DEFAULTS.capabilities.github.credentialSource).toBe(
       "environment",
@@ -61,5 +66,6 @@ describe("SPEC_DEFAULTS", () => {
       DEFAULT_OBSERVABILITY_ENABLED,
     );
     expect(Object.isFrozen(SPEC_DEFAULTS)).toBe(true);
+    expect(Object.isFrozen(DEFAULT_COMMAND_CAPABILITIES)).toBe(true);
   });
 });

@@ -9,6 +9,7 @@ import {
 } from "../../src/config/config-resolver.js";
 import {
   DEFAULT_CODEX_COMMAND,
+  DEFAULT_COMMAND_CAPABILITIES,
   DEFAULT_GITHUB_CAPABILITY_REQUIRED,
   DEFAULT_GITHUB_CREDENTIAL_SOURCE,
   DEFAULT_HOOK_TIMEOUT_MS,
@@ -70,6 +71,7 @@ describe("config-resolver", () => {
     expect(resolved.codex.turnTimeoutMs).toBe(DEFAULT_TURN_TIMEOUT_MS);
     expect(resolved.codex.readTimeoutMs).toBe(DEFAULT_READ_TIMEOUT_MS);
     expect(resolved.codex.stallTimeoutMs).toBe(DEFAULT_STALL_TIMEOUT_MS);
+    expect(resolved.capabilities.commands).toBe(DEFAULT_COMMAND_CAPABILITIES);
     expect(resolved.capabilities.github.required).toBe(
       DEFAULT_GITHUB_CAPABILITY_REQUIRED,
     );
@@ -215,6 +217,273 @@ describe("config-resolver", () => {
 
     expect(resolved.capabilities.github.required).toBe(true);
     expect(resolved.capabilities.github.credentialSource).toBe("gh_auth_token");
+  });
+
+  it("parses hook-only, agent-only, and dual-boundary command capabilities", () => {
+    const resolved = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {
+        capabilities: {
+          commands: {
+            node: {
+              hooks: ["after_create"],
+            },
+            rg: {
+              agent: true,
+              probe_args: ["--version"],
+            },
+            git: {
+              hooks: ["before_run", "after_run", "before_remove"],
+              agent: true,
+              probe_args: ["--version", "--build-options"],
+            },
+          },
+        },
+      },
+    });
+
+    expect(resolved.capabilities.commands).toEqual({
+      node: {
+        hooks: ["afterCreate"],
+        agent: false,
+        probeArgs: [],
+      },
+      rg: {
+        hooks: [],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+      git: {
+        hooks: ["beforeRun", "afterRun", "beforeRemove"],
+        agent: true,
+        probeArgs: ["--version", "--build-options"],
+      },
+    });
+  });
+
+  it("keeps omitted capability declarations on the frozen empty no-op default", () => {
+    const omitted = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {},
+    });
+    const emptyCapabilities = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {
+        capabilities: {},
+      },
+    });
+    const emptyCommands = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {
+        capabilities: {
+          commands: {},
+        },
+      },
+    });
+
+    expect(omitted.capabilities.commands).toBe(DEFAULT_COMMAND_CAPABILITIES);
+    expect(emptyCapabilities.capabilities).toEqual(omitted.capabilities);
+    expect(emptyCommands.capabilities).toEqual(omitted.capabilities);
+  });
+
+  it.each([
+    {
+      label: "null capabilities",
+      capabilities: null,
+    },
+    {
+      label: "scalar capabilities",
+      capabilities: "commands",
+    },
+    {
+      label: "null command map",
+      capabilities: { commands: null },
+    },
+    {
+      label: "list command map",
+      capabilities: { commands: [] },
+    },
+    {
+      label: "scalar command map",
+      capabilities: { commands: "rg" },
+    },
+    {
+      label: "null command declaration",
+      capabilities: { commands: { rg: null } },
+    },
+    {
+      label: "list command declaration",
+      capabilities: { commands: { rg: ["--version"] } },
+    },
+    {
+      label: "unsafe whitespace in executable name",
+      capabilities: {
+        commands: { "rg command": { agent: true } },
+      },
+    },
+    {
+      label: "path separator in executable name",
+      capabilities: {
+        commands: { "../rg": { agent: true } },
+      },
+    },
+    {
+      label: "shell metacharacter in executable name",
+      capabilities: {
+        commands: { "rg;rm": { agent: true } },
+      },
+    },
+    {
+      label: "unknown hook",
+      capabilities: {
+        commands: { rg: { hooks: ["during_run"] } },
+      },
+    },
+    {
+      label: "duplicate hook",
+      capabilities: {
+        commands: { rg: { hooks: ["before_run", "before_run"] } },
+      },
+    },
+    {
+      label: "non-list hooks",
+      capabilities: {
+        commands: { rg: { hooks: "before_run" } },
+      },
+    },
+    {
+      label: "non-boolean agent",
+      capabilities: {
+        commands: { rg: { agent: "true" } },
+      },
+    },
+    {
+      label: "non-list probe args",
+      capabilities: {
+        commands: { rg: { agent: true, probe_args: "--version" } },
+      },
+    },
+    {
+      label: "non-string probe arg",
+      capabilities: {
+        commands: { rg: { agent: true, probe_args: ["--version", 1] } },
+      },
+    },
+    {
+      label: "control character in probe arg",
+      capabilities: {
+        commands: { rg: { agent: true, probe_args: ["--token\nsecret"] } },
+      },
+    },
+    {
+      label: "NUL in probe arg",
+      capabilities: {
+        commands: { rg: { agent: true, probe_args: ["--token=\0secret"] } },
+      },
+    },
+    {
+      label: "unknown declaration field",
+      capabilities: {
+        commands: { rg: { agent: true, shell: "powershell" } },
+      },
+    },
+    {
+      label: "no enabled boundary",
+      capabilities: {
+        commands: {
+          rg: { hooks: [], agent: false, probe_args: ["--version"] },
+        },
+      },
+    },
+  ])("rejects malformed command capability config: $label", (input) => {
+    const validation = validateDispatchConfig(
+      resolveWorkflowConfig({
+        workflowPath: "/repo/WORKFLOW.md",
+        promptTemplate: "Prompt",
+        config: {
+          tracker: {
+            kind: "linear",
+            api_key: "token",
+            project_slug: "ENG",
+          },
+          capabilities: input.capabilities,
+        },
+      }),
+    );
+
+    expect(validation.ok).toBe(false);
+    if (validation.ok) {
+      return;
+    }
+    expect(validation.error.code).toBe(ERROR_CODES.configInvalid);
+    expect(validation.error.message).toContain("capabilities");
+  });
+
+  it("preserves malformed-command validation through CLI-style config copies", () => {
+    const resolved = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {
+        tracker: {
+          kind: "linear",
+          api_key: "token",
+          project_slug: "ENG",
+        },
+        capabilities: {
+          commands: {
+            "../rg": {
+              agent: true,
+            },
+          },
+        },
+      },
+    });
+    const copied = {
+      ...resolved,
+      server: {
+        ...resolved.server,
+        port: 8080,
+      },
+    };
+
+    expect(validateDispatchConfig(copied)).toMatchObject({
+      ok: false,
+      error: {
+        code: ERROR_CODES.configInvalid,
+      },
+    });
+  });
+
+  it("rejects malformed programmatic command capabilities at dispatch", () => {
+    const resolved = resolveWorkflowConfig({
+      workflowPath: "/repo/WORKFLOW.md",
+      promptTemplate: "Prompt",
+      config: {
+        tracker: {
+          kind: "linear",
+          api_key: "token",
+          project_slug: "ENG",
+        },
+      },
+    });
+    resolved.capabilities.commands = {
+      "rg;whoami": {
+        hooks: [],
+        agent: true,
+        probeArgs: ["--version"],
+      },
+    };
+
+    expect(validateDispatchConfig(resolved)).toMatchObject({
+      ok: false,
+      error: {
+        code: ERROR_CODES.configInvalid,
+      },
+    });
   });
 
   it("falls back to environment credentials for unknown GitHub credential sources", () => {

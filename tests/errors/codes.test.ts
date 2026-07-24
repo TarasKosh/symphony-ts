@@ -48,5 +48,14 @@ describe("ERROR_CODES", () => {
     expect(ERROR_CODES.githubCapabilityTransient).toBe(
       "github_capability_transient",
     );
+    expect(ERROR_CODES.requiredCommandNotFound).toBe(
+      "required_command_not_found",
+    );
+    expect(ERROR_CODES.requiredCommandExecutionDenied).toBe(
+      "required_command_execution_denied",
+    );
+    expect(ERROR_CODES.requiredCommandCapabilityTransient).toBe(
+      "required_command_capability_transient",
+    );
   });
 });
