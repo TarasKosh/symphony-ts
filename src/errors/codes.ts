@@ -39,6 +39,7 @@ export const ERROR_CODES = {
   invalidWorkspaceCwd: "invalid_workspace_cwd",
   workspaceCreateFailed: "workspace_create_failed",
   workspaceCleanupFailed: "workspace_cleanup_failed",
+  workspaceProvisioningIncomplete: "workspace_provisioning_incomplete",
   hookFailed: "hook_failed",
   hookTimedOut: "hook_timed_out",
   promptRenderFailed: "prompt_render_failed",

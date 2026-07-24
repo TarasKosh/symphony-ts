@@ -36,7 +36,10 @@ import {
 import { createTrackerFromConfig } from "../tracker/adapters.js";
 import type { IssueTracker } from "../tracker/tracker.js";
 import { WorkspaceHookRunner } from "../workspace/hooks.js";
-import { WorkspaceManager } from "../workspace/workspace-manager.js";
+import {
+  WorkspaceManager,
+  type WorkspaceProvisioningLogger,
+} from "../workspace/workspace-manager.js";
 import type {
   OrchestratorCoreOptions,
   StopRequest,
@@ -859,6 +862,11 @@ function createWorkspaceManagerFromConfig(
 ): WorkspaceManager {
   return new WorkspaceManager({
     root: config.workspace.root,
+    ...(logger === undefined || logger === null
+      ? {}
+      : {
+          provisioningLogger: createWorkspaceProvisioningLogger(logger),
+        }),
     hooks: new WorkspaceHookRunner({
       config: config.hooks,
       commands: getCommandCapabilities(config),
@@ -869,6 +877,25 @@ function createWorkspaceManagerFromConfig(
           }),
     }),
   });
+}
+
+function createWorkspaceProvisioningLogger(
+  logger: StructuredLogger,
+): WorkspaceProvisioningLogger {
+  return (entry) => {
+    void logger.log(
+      entry.level,
+      entry.event,
+      `Workspace provisioning recovery ${entry.outcome}.`,
+      {
+        outcome: entry.outcome,
+        issue_id: entry.issueId,
+        workspace_path: entry.workspacePath,
+        error_code: entry.errorCode,
+        remediation: entry.remediation,
+      },
+    );
+  };
 }
 
 async function createRuntimeLogger(input: {

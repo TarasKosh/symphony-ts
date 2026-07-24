@@ -450,6 +450,32 @@ describe("orchestrator core", () => {
     expect(timers.scheduled).toEqual([]);
   });
 
+  it("places incomplete workspace provisioning on an operator hold without capability metadata", async () => {
+    const timers = createFakeTimerScheduler();
+    const orchestrator = createOrchestrator({ timerScheduler: timers });
+
+    await orchestrator.pollTick();
+    const hold = orchestrator.onWorkerExit({
+      issueId: "1",
+      outcome: "abnormal",
+      errorCode: ERROR_CODES.workspaceProvisioningIncomplete,
+      reason:
+        "Workspace provisioning is incomplete; inspect the preserved workspace.",
+    });
+
+    expect(hold).toMatchObject({
+      issueId: "1",
+      identifier: "ISSUE-1",
+      attempt: 1,
+      error:
+        "workspace_provisioning_incomplete: worker exited: Workspace provisioning is incomplete; inspect the preserved workspace.",
+    });
+    expect(hold).not.toHaveProperty("capabilityFailure");
+    expect(orchestrator.getState().operatorHolds["1"]).toEqual(hold);
+    expect(orchestrator.getState().retryAttempts["1"]).toBeUndefined();
+    expect(timers.scheduled).toEqual([]);
+  });
+
   it("suppresses polling while held and retries only the selected issue on explicit request", async () => {
     const timers = createFakeTimerScheduler();
     const orchestrator = createOrchestrator({ timerScheduler: timers });
