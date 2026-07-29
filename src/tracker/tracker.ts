@@ -16,6 +16,7 @@ export interface TrackerLifecycleConfig {
 export interface TrackerHandoffMetadata {
   readyForReview: boolean;
   prUrl: string | null;
+  branch: string | null;
   prNumber: string | null;
   headSha: string | null;
   validationSummary: string | null;
