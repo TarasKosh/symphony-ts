@@ -38,6 +38,8 @@ export interface NotionTrackerAdapterOptions {
   priorityProperty: string | null;
   labelsProperty: string | null;
   blockedByProperty: string | null;
+  prProperty: string | null;
+  branchProperty: string | null;
 }
 
 export interface NotionTrackerClientOptions
@@ -90,6 +92,8 @@ interface NotionErrorBody {
 
 interface NotionResolvedSchema {
   properties: NotionIssuePropertyMap;
+  prProperty: NotionPropertyDescriptor | null;
+  branchProperty: NotionPropertyDescriptor | null;
 }
 
 const NOTION_RETRIABLE_STATUS_CODES = new Set([429, 529]);
@@ -125,6 +129,8 @@ export class NotionTrackerClient implements IssueTracker {
       priorityProperty: options.priorityProperty ?? null,
       labelsProperty: options.labelsProperty ?? null,
       blockedByProperty: options.blockedByProperty ?? null,
+      prProperty: options.prProperty ?? null,
+      branchProperty: options.branchProperty ?? null,
     };
   }
 
@@ -248,10 +254,30 @@ export class NotionTrackerClient implements IssueTracker {
       states: input.lifecycle.handoffStates,
       field: "tracker.handoff_states",
     });
+    const schema = await this.getSchema();
+    const extraProperties: Record<string, unknown> = {};
+    if (schema.prProperty !== null && input.metadata.prUrl !== null) {
+      extraProperties[schema.prProperty.name] = {
+        url: input.metadata.prUrl,
+      };
+    }
+    if (schema.branchProperty !== null && input.metadata.branch !== null) {
+      extraProperties[schema.branchProperty.name] = {
+        rich_text: [
+          {
+            type: "text",
+            text: {
+              content: input.metadata.branch,
+            },
+          },
+        ],
+      };
+    }
     return this.transitionIssueStatus({
       issue: input.issue,
       state,
       field: "tracker.handoff_states",
+      ...(Object.keys(extraProperties).length === 0 ? {} : { extraProperties }),
     });
   }
 
@@ -364,6 +390,7 @@ export class NotionTrackerClient implements IssueTracker {
     issue: Issue;
     state: string;
     field: string;
+    extraProperties?: Readonly<Record<string, unknown>>;
   }): Promise<TrackerLifecycleTransitionResult> {
     const schema = await this.getSchema();
     requireStatusOption(schema.properties.status, {
@@ -392,6 +419,7 @@ export class NotionTrackerClient implements IssueTracker {
               name: input.state,
             },
           },
+          ...(input.extraProperties ?? {}),
         },
       },
     });
@@ -501,6 +529,18 @@ export class NotionTrackerClient implements IssueTracker {
           allowedTypes: ["relation"],
         }),
       },
+      prProperty: resolveSchemaProperty(schemaProperties, {
+        configured: this.adapterOptions.prProperty,
+        field: "tracker.pr_property",
+        required: false,
+        allowedTypes: ["url"],
+      }),
+      branchProperty: resolveSchemaProperty(schemaProperties, {
+        configured: this.adapterOptions.branchProperty,
+        field: "tracker.branch_property",
+        required: false,
+        allowedTypes: ["rich_text"],
+      }),
     };
   }
 
@@ -1080,6 +1120,16 @@ export function readNotionTrackerAdapterOptions(
       adapterOptions,
       "blocked_by_property",
       "blockedByProperty",
+    ),
+    prProperty: readAdapterOptionString(
+      adapterOptions,
+      "pr_property",
+      "prProperty",
+    ),
+    branchProperty: readAdapterOptionString(
+      adapterOptions,
+      "branch_property",
+      "branchProperty",
     ),
   };
 }

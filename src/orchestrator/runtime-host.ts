@@ -1176,6 +1176,7 @@ function buildWorkerProgressSignature(result: AgentRunResult): string {
         ? {
             state: result.handoff.result.state,
             prUrl: result.handoff.metadata.prUrl,
+            branch: result.handoff.metadata.branch,
             prNumber: result.handoff.metadata.prNumber,
             headSha: result.handoff.metadata.headSha,
           }

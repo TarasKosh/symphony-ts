@@ -1,13 +1,39 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ERROR_CODES } from "../../src/errors/codes.js";
-import { NotionTrackerClient, type TrackerError } from "../../src/index.js";
+import {
+  NotionTrackerClient,
+  type TrackerError,
+  readNotionTrackerAdapterOptions,
+} from "../../src/index.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe("NotionTrackerClient", () => {
+  it("reads optional handoff property aliases without requiring them", () => {
+    expect(readNotionTrackerAdapterOptions({})).toMatchObject({
+      prProperty: null,
+      branchProperty: null,
+    });
+    expect(
+      readNotionTrackerAdapterOptions({ pr_property: "PR" }).prProperty,
+    ).toBe("PR");
+    expect(
+      readNotionTrackerAdapterOptions({ prProperty: "Pull request" })
+        .prProperty,
+    ).toBe("Pull request");
+    expect(
+      readNotionTrackerAdapterOptions({ branch_property: "Branch" })
+        .branchProperty,
+    ).toBe("Branch");
+    expect(
+      readNotionTrackerAdapterOptions({ branchProperty: "Git branch" })
+        .branchProperty,
+    ).toBe("Git branch");
+  });
+
   it("fetches candidate issues via data source queries, pagination, sorts, and blocker lookups", async () => {
     const fetchFn = vi
       .fn<typeof fetch>()
@@ -525,7 +551,11 @@ describe("NotionTrackerClient", () => {
           }),
         ),
       );
-    const client = createClient({ fetchFn });
+    const client = createClient({
+      fetchFn,
+      prProperty: "PR",
+      branchProperty: "Branch",
+    });
 
     await expect(
       client.claimIssue({
@@ -587,6 +617,7 @@ describe("NotionTrackerClient", () => {
         metadata: {
           readyForReview: true,
           prUrl: "https://github.com/acme/repo/pull/12",
+          branch: null,
           prNumber: "12",
           headSha: "abc123",
           validationSummary: "pnpm test passed",
@@ -613,6 +644,230 @@ describe("NotionTrackerClient", () => {
     });
   });
 
+  it("does not write unconfigured handoff properties", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(dataSourceSchema()))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          notionPage({
+            id: "page-1",
+            key: "NOTION-1",
+            state: "In Review",
+          }),
+        ),
+      );
+    const client = createClient({
+      fetchFn,
+      prProperty: null,
+      branchProperty: null,
+    });
+
+    await client.handoffIssue({
+      issue: createIssue({ id: "page-1", state: "In Progress" }),
+      lifecycle: createLifecycle(),
+      metadata: {
+        readyForReview: true,
+        prUrl: "https://github.com/acme/repo/pull/12",
+        branch: "feature/notion-branch-property",
+        prNumber: "12",
+        headSha: "abc123",
+        validationSummary: "pnpm test passed",
+        risks: null,
+      },
+    });
+
+    expect(parseRequestBody(fetchFn.mock.calls[1]?.[1])).toEqual({
+      properties: {
+        Status: {
+          status: {
+            name: "In Review",
+          },
+        },
+      },
+    });
+  });
+
+  it("writes configured PR URL and branch properties during handoff", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(dataSourceSchema()))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          notionPage({
+            id: "page-1",
+            key: "NOTION-1",
+            state: "In Review",
+          }),
+        ),
+      );
+    const client = createClient({
+      fetchFn,
+      prProperty: "PR",
+      branchProperty: "Branch",
+    });
+
+    await client.handoffIssue({
+      issue: createIssue({ id: "page-1", state: "In Progress" }),
+      lifecycle: createLifecycle(),
+      metadata: {
+        readyForReview: true,
+        prUrl: "https://github.com/acme/repo/pull/12",
+        branch: "feature/notion-branch-property",
+        prNumber: "12",
+        headSha: "abc123",
+        validationSummary: "pnpm test passed",
+        risks: null,
+      },
+    });
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(parseRequestBody(fetchFn.mock.calls[1]?.[1])).toEqual({
+      properties: {
+        Status: {
+          status: {
+            name: "In Review",
+          },
+        },
+        PR: {
+          url: "https://github.com/acme/repo/pull/12",
+        },
+        Branch: {
+          rich_text: [
+            {
+              type: "text",
+              text: {
+                content: "feature/notion-branch-property",
+              },
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("does not write configured handoff properties when metadata values are null", async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(dataSourceSchema()))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          notionPage({
+            id: "page-1",
+            key: "NOTION-1",
+            state: "In Review",
+          }),
+        ),
+      );
+    const client = createClient({
+      fetchFn,
+      prProperty: "PR",
+      branchProperty: "Branch",
+    });
+
+    await client.handoffIssue({
+      issue: createIssue({ id: "page-1", state: "In Progress" }),
+      lifecycle: createLifecycle(),
+      metadata: {
+        readyForReview: true,
+        prUrl: null,
+        branch: null,
+        prNumber: null,
+        headSha: "abc123",
+        validationSummary: "pnpm test passed",
+        risks: null,
+      },
+    });
+
+    expect(parseRequestBody(fetchFn.mock.calls[1]?.[1])).toEqual({
+      properties: {
+        Status: {
+          status: {
+            name: "In Review",
+          },
+        },
+      },
+    });
+  });
+
+  it("rejects missing and wrong-typed configured PR properties", async () => {
+    const missingPropertyClient = createClient({
+      fetchFn: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse(dataSourceSchema({ includePrProperty: false })),
+        ),
+      prProperty: "PR",
+    });
+    const wrongTypeClient = createClient({
+      fetchFn: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse(dataSourceSchema({ prType: "rich_text" })),
+        ),
+      prProperty: "PR",
+    });
+    const input = {
+      issue: createIssue({ id: "page-1", state: "In Progress" }),
+      lifecycle: createLifecycle(),
+      metadata: {
+        readyForReview: true,
+        prUrl: "https://github.com/acme/repo/pull/12",
+        branch: null,
+        prNumber: "12",
+        headSha: "abc123",
+        validationSummary: "pnpm test passed",
+        risks: null,
+      },
+    };
+
+    await expect(missingPropertyClient.handoffIssue(input)).rejects.toThrow(
+      "tracker.pr_property 'PR' was not found in the Notion data source schema.",
+    );
+    await expect(wrongTypeClient.handoffIssue(input)).rejects.toThrow(
+      "tracker.pr_property 'PR' must have one of these Notion property types: url.",
+    );
+  });
+
+  it("rejects missing and wrong-typed configured branch properties", async () => {
+    const missingPropertyClient = createClient({
+      fetchFn: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse(dataSourceSchema({ includeBranchProperty: false })),
+        ),
+      branchProperty: "Branch",
+    });
+    const wrongTypeClient = createClient({
+      fetchFn: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          jsonResponse(dataSourceSchema({ branchType: "title" })),
+        ),
+      branchProperty: "Branch",
+    });
+    const input = {
+      issue: createIssue({ id: "page-1", state: "In Progress" }),
+      lifecycle: createLifecycle(),
+      metadata: {
+        readyForReview: true,
+        prUrl: null,
+        branch: "feature/notion-branch-property",
+        prNumber: null,
+        headSha: "abc123",
+        validationSummary: "pnpm test passed",
+        risks: null,
+      },
+    };
+
+    await expect(missingPropertyClient.handoffIssue(input)).rejects.toThrow(
+      "tracker.branch_property 'Branch' was not found in the Notion data source schema.",
+    );
+    await expect(wrongTypeClient.handoffIssue(input)).rejects.toThrow(
+      "tracker.branch_property 'Branch' must have one of these Notion property types: rich_text.",
+    );
+  });
+
   it("posts blocker questions before moving the page to the configured blocked state", async () => {
     const fetchFn = vi
       .fn<typeof fetch>()
@@ -635,7 +890,11 @@ describe("NotionTrackerClient", () => {
           }),
         ),
       );
-    const client = createClient({ fetchFn });
+    const client = createClient({
+      fetchFn,
+      prProperty: "PR",
+      branchProperty: "Branch",
+    });
 
     await expect(
       client.blockIssue({
@@ -854,6 +1113,7 @@ describe("NotionTrackerClient", () => {
         metadata: {
           readyForReview: true,
           prUrl: null,
+          branch: null,
           prNumber: null,
           headSha: null,
           validationSummary: null,
@@ -1008,6 +1268,8 @@ function createClient(
     priorityProperty: "Priority",
     labelsProperty: "Labels",
     blockedByProperty: "Blocked by",
+    prProperty: null,
+    branchProperty: null,
     fetchFn: overrides.fetchFn ?? vi.fn<typeof fetch>(),
     ...overrides,
   });
@@ -1016,6 +1278,10 @@ function createClient(
 function dataSourceSchema(
   overrides: {
     blockedById?: string;
+    branchType?: "rich_text" | "title";
+    includeBranchProperty?: boolean;
+    includePrProperty?: boolean;
+    prType?: "url" | "rich_text";
     statusType?: "status" | "select";
     statusOptions?: string[];
   } = {},
@@ -1063,6 +1329,22 @@ function dataSourceSchema(
         id: overrides.blockedById ?? "blocked-id",
         type: "relation",
       },
+      ...(overrides.includePrProperty === false
+        ? {}
+        : {
+            PR: {
+              id: "pr-id",
+              type: overrides.prType ?? "url",
+            },
+          }),
+      ...(overrides.includeBranchProperty === false
+        ? {}
+        : {
+            Branch: {
+              id: "branch-id",
+              type: overrides.branchType ?? "rich_text",
+            },
+          }),
     },
   };
 }
