@@ -713,6 +713,7 @@ describe("AgentRunner", () => {
             await handoffTool.execute({
               ready_for_review: true,
               pr_url: "https://github.com/acme/repo/pull/12",
+              branch: "feature/abc-123",
               pr_number: 12,
               head_sha: "abc123",
               validation_summary: "pnpm test passed",
@@ -742,6 +743,7 @@ describe("AgentRunner", () => {
       metadata: {
         readyForReview: true,
         prUrl: "https://github.com/acme/repo/pull/12",
+        branch: "feature/abc-123",
         prNumber: "12",
         headSha: "abc123",
         validationSummary: "pnpm test passed",

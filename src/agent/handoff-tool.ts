@@ -33,6 +33,10 @@ export function createSymphonyHandoffDynamicTool(
           type: ["string", "null"],
           description: "Pull request URL, when available.",
         },
+        branch: {
+          type: ["string", "null"],
+          description: "Branch the agent worked on, when available.",
+        },
         pr_number: {
           type: ["string", "number", "null"],
           description: "Pull request number, when available.",
@@ -93,6 +97,7 @@ function parseHandoffMetadata(input: unknown): TrackerHandoffMetadata {
   return {
     readyForReview: readBoolean(record.ready_for_review, record.readyForReview),
     prUrl: readOptionalString(record.pr_url, record.prUrl),
+    branch: readOptionalString(record.branch),
     prNumber: readOptionalString(record.pr_number, record.prNumber),
     headSha: readOptionalString(record.head_sha, record.headSha),
     validationSummary: readOptionalString(

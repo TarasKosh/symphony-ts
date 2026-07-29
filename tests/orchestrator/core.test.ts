@@ -256,6 +256,7 @@ describe("orchestrator core", () => {
         metadata: {
           readyForReview: true,
           prUrl: "https://github.com/acme/repo/pull/12",
+          branch: null,
           prNumber: "12",
           headSha: "abc123",
           validationSummary: "pnpm test passed",
@@ -288,6 +289,7 @@ describe("orchestrator core", () => {
         metadata: {
           readyForReview: true,
           prUrl: "https://github.com/acme/repo/pull/12",
+          branch: null,
           prNumber: "12",
           headSha: "abc123",
           validationSummary: "pnpm test passed",
