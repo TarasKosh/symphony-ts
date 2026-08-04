@@ -384,6 +384,16 @@ Fields:
 - `interval_ms` (integer or string integer)
   - Default: `30000`
   - Changes should be re-applied at runtime and affect future tick scheduling without restart.
+- `issue_comments_between_turns` (boolean or string boolean)
+  - Default: `false`
+  - When enabled and the tracker supports ticket-context reads, establish a comment baseline before
+    the first turn, re-read comments after each completed turn, and append only new comments to the
+    next continuation prompt on the same live coding-agent thread.
+  - Comment read failures are non-fatal and are retried at the next turn boundary.
+- `issue_comment_ignored_authors` (list of strings or comma-separated string)
+  - Default: empty.
+  - Matching is case-insensitive and suppresses comments created by configured integrations or
+    bots while still advancing the in-memory comment cursor.
 
 #### 5.3.3 `workspace` (object)
 
@@ -394,6 +404,15 @@ Fields:
   - `~` and strings containing path separators are expanded.
   - Bare strings without path separators are preserved as-is (relative roots are allowed but
     discouraged).
+- `retention` (object, optional)
+  - Disabled by default. `states` and `stale_after_days` must be configured together.
+  - `states`: non-active, non-terminal tracker states eligible for aged cleanup.
+  - `stale_after_days`: positive integer age measured from the tracker's `updated_at` timestamp.
+  - `check_interval_ms`: positive integer between retention sweeps; default `86400000` (24 hours).
+  - Retention states must not overlap configured active or terminal states.
+  - A stale workspace is removed only when it is a real Git repository, has no tracked or untracked
+    changes, has a configured upstream, has zero commits ahead of that upstream, and has no active
+    worker. Failed safety checks preserve the workspace and emit a warning.
 
 #### 5.3.4 `hooks` (object)
 
@@ -739,7 +758,12 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.active_states`: list/string, default `Todo, In Progress`
 - `tracker.terminal_states`: list/string, default `Closed, Cancelled, Canceled, Duplicate, Done`
 - `polling.interval_ms`: integer, default `30000`
+- `polling.issue_comments_between_turns`: boolean, default `false`
+- `polling.issue_comment_ignored_authors`: list/string, default empty
 - `workspace.root`: path, default `<system-temp>/symphony_workspaces`
+- `workspace.retention.states`: list/string, default empty (disabled)
+- `workspace.retention.stale_after_days`: positive integer, default unset (disabled)
+- `workspace.retention.check_interval_ms`: positive integer, default `86400000` (24h)
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
@@ -808,6 +832,10 @@ Important nuance:
 - The first turn should use the full rendered task prompt.
 - Continuation turns should send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
+- When `polling.issue_comments_between_turns` is enabled, the runner should establish a comment
+  baseline before the first turn and re-read ticket comments after each completed active-state
+  turn. Newly observed, non-ignored comments are included in the next continuation prompt; they are
+  never injected into a turn that is already running.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -885,6 +913,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Configured stale-workspace retention runs at startup and periodically. It is independent of
+  terminal cleanup and fails closed on Git safety uncertainty.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
@@ -903,6 +933,8 @@ Tick sequence:
 4. Sort issues by dispatch priority.
 5. Dispatch eligible issues while slots remain.
 6. Notify observability/status consumers of state changes.
+7. When the configured retention interval is due, sweep eligible non-active workspaces after the
+   dispatch/reconciliation cycle.
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
@@ -1023,6 +1055,9 @@ Workspace persistence:
 
 - Workspaces are reused across runs for the same issue.
 - Successful runs do not auto-delete workspaces.
+- Terminal cleanup remains unconditional. Optional non-terminal retention may remove a stale
+  workspace only after all age, state, active-run, cleanliness, upstream, and ahead-count checks
+  pass.
 
 ### 9.2 Workspace Creation and Reuse
 

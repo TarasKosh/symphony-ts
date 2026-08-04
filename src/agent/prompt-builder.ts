@@ -2,6 +2,7 @@ import { Liquid } from "liquidjs";
 
 import type { Issue, WorkflowDefinition } from "../domain/model.js";
 import { ERROR_CODES } from "../errors/codes.js";
+import type { TrackerIssueContextEntry } from "../tracker/tracker.js";
 
 export const DEFAULT_WORKFLOW_PROMPT =
   "You are working on an issue from the configured tracker.";
@@ -40,6 +41,7 @@ export interface RenderPromptInput {
 export interface BuildTurnPromptInput extends RenderPromptInput {
   turnNumber: number;
   maxTurns: number;
+  trackerComments?: readonly TrackerIssueContextEntry[];
 }
 
 export function getEffectivePromptTemplate(promptTemplate: string): string {
@@ -75,6 +77,7 @@ export async function buildTurnPrompt(
     attempt: input.attempt,
     turnNumber: input.turnNumber,
     maxTurns: input.maxTurns,
+    trackerComments: input.trackerComments ?? [],
   });
 }
 
@@ -83,13 +86,14 @@ export function buildContinuationPrompt(input: {
   attempt: number | null;
   turnNumber: number;
   maxTurns: number;
+  trackerComments?: readonly TrackerIssueContextEntry[];
 }): string {
   const attemptLine =
     input.attempt === null
       ? "This worker session started from the initial dispatch."
       : `This worker session is running retry/continuation attempt ${input.attempt}.`;
 
-  return [
+  const lines = [
     `Continue working on issue ${input.issue.identifier}: ${input.issue.title}.`,
     `This is continuation turn ${input.turnNumber} of ${input.maxTurns} in the current worker session.`,
     attemptLine,
@@ -97,7 +101,28 @@ export function buildContinuationPrompt(input: {
     "Reuse the existing thread context and current workspace state.",
     "Do not restate the original task prompt unless it is strictly needed.",
     "Make the next best progress on the issue, then stop when this session has no further useful work to do.",
-  ].join("\n");
+  ];
+
+  const trackerComments = input.trackerComments ?? [];
+  if (trackerComments.length > 0) {
+    lines.push(
+      "",
+      "New tracker comments arrived since the previous turn. Treat them as current operator input:",
+      ...trackerComments.flatMap(formatTrackerComment),
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function formatTrackerComment(entry: TrackerIssueContextEntry): string[] {
+  const author = entry.author?.trim() || "unknown author";
+  const createdAt = entry.createdAt?.trim() || "unknown time";
+  return [
+    `--- tracker comment from ${author} at ${createdAt} ---`,
+    entry.text,
+    "--- end tracker comment ---",
+  ];
 }
 
 function toTemplateIssue(issue: Issue): Record<string, unknown> {

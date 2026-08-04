@@ -31,6 +31,7 @@ export interface TrackerBlockerMetadata {
 
 export interface TrackerIssueContextEntry {
   source: "body" | "comment";
+  id?: string | null;
   text: string;
   createdAt: string | null;
   author: string | null;

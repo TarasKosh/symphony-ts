@@ -22,10 +22,22 @@ export interface WorkflowTrackerConfig {
 
 export interface WorkflowPollingConfig {
   intervalMs: number;
+  /** Optional for backwards-compatible programmatic construction. */
+  issueCommentsBetweenTurns?: boolean;
+  /** Optional for backwards-compatible programmatic construction. */
+  issueCommentIgnoredAuthors?: string[];
+}
+
+export interface WorkflowWorkspaceRetentionConfig {
+  states: string[];
+  staleAfterMs: number | null;
+  checkIntervalMs: number;
 }
 
 export interface WorkflowWorkspaceConfig {
   root: string;
+  /** Optional for backwards-compatible programmatic construction. */
+  retention?: WorkflowWorkspaceRetentionConfig;
 }
 
 export interface WorkflowAgentConfig {

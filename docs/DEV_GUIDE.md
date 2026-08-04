@@ -208,7 +208,12 @@ results when ready for review.
 | `tracker.require_claim_before_agent` | Failed claim blocks Codex startup for write-capable adapters | `true` |
 | `tracker.terminal_states` | States that trigger workspace cleanup | `[Closed, Cancelled, Canceled, Duplicate, Done]` |
 | `polling.interval_ms` | Poll interval in milliseconds | `30000` |
+| `polling.issue_comments_between_turns` | Add newly observed tracker comments to the next turn on the same live thread | `false` |
+| `polling.issue_comment_ignored_authors` | Integration/bot authors excluded from comment delivery | `[]` |
 | `workspace.root` | Root directory for all workspaces | `<os.tmpdir()>/symphony_workspaces` |
+| `workspace.retention.states` | Non-active states eligible for guarded stale cleanup | `[]` (disabled) |
+| `workspace.retention.stale_after_days` | Age since tracker update before guarded cleanup | unset (disabled) |
+| `workspace.retention.check_interval_ms` | Interval between stale-workspace sweeps | `86400000` |
 | `hooks.after_create` | Shell command run after a new empty workspace is created; normally clone the target repo here | `null` |
 | `hooks.before_run` | Shell command run before each agent turn (fatal on non-zero exit) | `null` |
 | `hooks.after_run` | Shell command run after each agent turn (errors suppressed) | `null` |
@@ -440,6 +445,9 @@ State keys are matched case-insensitively.
 
 These fields take effect on the next poll tick without restarting Symphony:
 - `polling.interval_ms`
+- `polling.issue_comments_between_turns`
+- `polling.issue_comment_ignored_authors`
+- `workspace.retention.*`
 - `agent.max_concurrent_agents`
 - `agent.max_retry_backoff_ms`
 - `hooks.timeout_ms`

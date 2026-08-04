@@ -118,6 +118,31 @@ describe("prompt builder", () => {
     expect(prompt).toContain("initial dispatch");
   });
 
+  it("includes newly observed tracker comments only in continuation guidance", async () => {
+    const prompt = await buildTurnPrompt({
+      workflow: {
+        promptTemplate: "Initial {{ issue.identifier }}",
+      },
+      issue: ISSUE_FIXTURE,
+      attempt: null,
+      turnNumber: 2,
+      maxTurns: 5,
+      trackerComments: [
+        {
+          source: "comment",
+          id: "comment-2",
+          text: "Please preserve the current public API.",
+          createdAt: "2026-03-06T02:00:00.000Z",
+          author: "Operator",
+        },
+      ],
+    });
+
+    expect(prompt).toContain("New tracker comments arrived");
+    expect(prompt).toContain("Operator at 2026-03-06T02:00:00.000Z");
+    expect(prompt).toContain("Please preserve the current public API.");
+  });
+
   it("fails on unknown variables in strict mode", async () => {
     await expect(
       renderPrompt({

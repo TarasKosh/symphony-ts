@@ -31,6 +31,7 @@ import {
   type TrackerBlockerRunResult,
   type TrackerHandoffRunResult,
   type TrackerIssueContext,
+  type TrackerIssueContextEntry,
   type TrackerLifecycleConfig,
   supportsTrackerBlockWrite,
   supportsTrackerIssueContextRead,
@@ -398,6 +399,10 @@ export class AgentRunner {
         client.configureDynamicTools(dynamicTools);
       }
 
+      const trackerCommentCursor =
+        await this.initializeTrackerCommentCursor(issue);
+      let trackerCommentsForTurn: TrackerIssueContextEntry[] = [];
+
       for (
         let turnNumber = 1;
         turnNumber <= this.config.agent.maxTurns;
@@ -418,6 +423,7 @@ export class AgentRunner {
           attempt: input.attempt,
           turnNumber,
           maxTurns: this.config.agent.maxTurns,
+          trackerComments: trackerCommentsForTurn,
         });
         const title = `${issue.identifier}: ${issue.title}`;
 
@@ -484,6 +490,11 @@ export class AgentRunner {
         if (!this.isIssueStillActive(issue)) {
           break;
         }
+
+        trackerCommentsForTurn = await this.pollNewTrackerComments(
+          issue,
+          trackerCommentCursor,
+        );
       }
 
       if (handoffRef.current?.status === "failed") {
@@ -692,6 +703,73 @@ export class AgentRunner {
     }
   }
 
+  private async initializeTrackerCommentCursor(
+    issue: Issue,
+  ): Promise<TrackerCommentCursor | null> {
+    if (
+      this.config.polling.issueCommentsBetweenTurns !== true ||
+      !supportsTrackerIssueContextRead(this.tracker)
+    ) {
+      return null;
+    }
+
+    const context = await this.readIssueContextBestEffort(issue);
+    const cursor: TrackerCommentCursor = {
+      baselineEstablished: commentsWereAvailable(context),
+      seen: new Set<string>(),
+    };
+    if (cursor.baselineEstablished && context !== null) {
+      for (const entry of context.entries) {
+        if (entry.source === "comment") {
+          cursor.seen.add(trackerCommentKey(entry));
+        }
+      }
+    }
+
+    return cursor;
+  }
+
+  private async pollNewTrackerComments(
+    issue: Issue,
+    cursor: TrackerCommentCursor | null,
+  ): Promise<TrackerIssueContextEntry[]> {
+    if (cursor === null) {
+      return [];
+    }
+
+    const context = await this.readIssueContextBestEffort(issue);
+    if (!commentsWereAvailable(context) || context === null) {
+      return [];
+    }
+
+    const ignoredAuthors = new Set(
+      (this.config.polling.issueCommentIgnoredAuthors ?? []).map((author) =>
+        normalizeTrackerAuthor(author),
+      ),
+    );
+    const newComments: TrackerIssueContextEntry[] = [];
+    for (const entry of context.entries) {
+      if (entry.source !== "comment") {
+        continue;
+      }
+
+      const key = trackerCommentKey(entry);
+      if (cursor.seen.has(key)) {
+        continue;
+      }
+      cursor.seen.add(key);
+
+      const author = normalizeTrackerAuthor(entry.author ?? "");
+      if (author !== "" && ignoredAuthors.has(author)) {
+        continue;
+      }
+
+      newComments.push(entry);
+    }
+    cursor.baselineEstablished = true;
+    return newComments;
+  }
+
   private async refreshIssueState(issue: Issue): Promise<Issue> {
     const refreshed = await this.tracker.fetchIssueStatesByIds([issue.id]);
     const next = refreshed[0];
@@ -775,6 +853,31 @@ export class AgentRunner {
       cause: input.error,
     });
   }
+}
+
+interface TrackerCommentCursor {
+  baselineEstablished: boolean;
+  seen: Set<string>;
+}
+
+function commentsWereAvailable(context: TrackerIssueContext | null): boolean {
+  return (
+    context !== null &&
+    !context.unavailableSources.some((source) => source.source === "comments")
+  );
+}
+
+function trackerCommentKey(entry: TrackerIssueContextEntry): string {
+  const id = entry.id?.trim();
+  if (id) {
+    return `id:${id}`;
+  }
+
+  return JSON.stringify([entry.createdAt, entry.author, entry.text]);
+}
+
+function normalizeTrackerAuthor(author: string): string {
+  return author.trim().toLowerCase();
 }
 
 function extractCapabilityFailure(

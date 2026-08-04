@@ -56,7 +56,9 @@ issue-scoped `symphony_block` dynamic tool for clarification questions and block
 write-back. If it implements `readIssueContext` and `appendIssueNote`, Symphony can provide
 issue-scoped ticket tools for reading tracker-native body/comment context and appending ordinary
 notes without requiring an unrelated connector. Adapters that do not implement those methods keep
-their existing behavior.
+their existing behavior. When `polling.issue_comments_between_turns` is enabled, adapters with
+`readIssueContext` also provide newly observed comments to the next turn on the same live agent
+thread; implementations should return stable entry IDs when the tracker exposes them.
 
 ## WORKFLOW.md Selection
 

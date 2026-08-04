@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -31,6 +33,7 @@ import type {
 } from "../../src/tracker/tracker.js";
 
 const tempDirs: string[] = [];
+const execFileAsync = promisify(execFile);
 const codexFixturePath = join(
   dirname(fileURLToPath(import.meta.url)),
   "../fixtures/codex-fake-server.mjs",
@@ -102,6 +105,70 @@ describe("runtime integration", () => {
       "Done",
       "Canceled",
     ]);
+  });
+
+  it("runs configured stale-workspace retention at startup after Git safety checks", async () => {
+    const root = await createTempDir("symphony-retention-runtime-");
+    const logsRoot = join(root, "logs");
+    const workspaceRoot = join(root, "workspaces");
+    const staleWorkspace = join(workspaceRoot, "stale-1");
+    const remote = join(root, "remote.git");
+    await mkdir(workspaceRoot, { recursive: true });
+    await runGit(root, ["init", "--bare", remote]);
+    await runGit(root, ["init", staleWorkspace]);
+    await runGit(staleWorkspace, ["config", "user.name", "Symphony Test"]);
+    await runGit(staleWorkspace, [
+      "config",
+      "user.email",
+      "symphony@example.test",
+    ]);
+    await writeFile(join(staleWorkspace, "README.md"), "stale but pushed\n");
+    await runGit(staleWorkspace, ["add", "README.md"]);
+    await runGit(staleWorkspace, ["commit", "-m", "Initial commit"]);
+    await runGit(staleWorkspace, ["remote", "add", "origin", remote]);
+    await runGit(staleWorkspace, ["push", "-u", "origin", "HEAD:main"]);
+
+    const staleIssue = createIssue({
+      id: "stale-1",
+      identifier: "STALE-1",
+      state: "In Review",
+      updatedAt: "2026-05-01T00:00:00.000Z",
+    });
+    const tracker: IssueTracker = {
+      fetchCandidateIssues: vi.fn(async () => []),
+      fetchIssuesByStates: vi.fn(async (states: string[]) =>
+        states.includes("In Review") ? [staleIssue] : [],
+      ),
+      fetchIssueStatesByIds: vi.fn(async () => []),
+    };
+    const service = await startRuntimeService({
+      config: createConfig({
+        workspace: {
+          root: workspaceRoot,
+          retention: {
+            states: ["In Review"],
+            staleAfterMs: 30 * 86_400_000,
+            checkIntervalMs: 86_400_000,
+          },
+        },
+      }),
+      logsRoot,
+      tracker,
+      stdout: new PassThrough(),
+      now: () => new Date("2026-08-01T00:00:00.000Z"),
+    });
+
+    try {
+      await expect(stat(staleWorkspace)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await service.shutdown();
+    }
+
+    const logFile = await readFile(join(logsRoot, "symphony.jsonl"), "utf8");
+    expect(logFile).toContain('"event":"workspace_retention_removed"');
+    expect(logFile).toContain('"issue_identifier":"STALE-1"');
   });
 
   it("returns a nonzero exit code when the real runtime host exits abnormally", async () => {
@@ -753,6 +820,10 @@ async function createTempDir(prefix: string): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), prefix));
   tempDirs.push(directory);
   return directory;
+}
+
+async function runGit(cwd: string, args: string[]): Promise<void> {
+  await execFileAsync("git", args, { cwd });
 }
 
 async function resolveRuntimeConfig(

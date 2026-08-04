@@ -19,7 +19,16 @@ export const DEFAULT_TERMINAL_STATES = [
 ] as const;
 
 export const DEFAULT_POLL_INTERVAL_MS = 30_000;
+export const DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS = false;
+export const DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS = Object.freeze(
+  [],
+) as readonly string[];
 export const DEFAULT_WORKSPACE_ROOT = join(tmpdir(), "symphony_workspaces");
+export const DEFAULT_WORKSPACE_RETENTION_STATES = Object.freeze(
+  [],
+) as readonly string[];
+export const DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS = null;
+export const DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS = 86_400_000;
 export const DEFAULT_HOOK_TIMEOUT_MS = 60_000;
 
 export const DEFAULT_MAX_CONCURRENT_AGENTS = 10;
@@ -65,9 +74,16 @@ export const SPEC_DEFAULTS = Object.freeze({
   },
   polling: {
     intervalMs: DEFAULT_POLL_INTERVAL_MS,
+    issueCommentsBetweenTurns: DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS,
+    issueCommentIgnoredAuthors: DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS,
   },
   workspace: {
     root: DEFAULT_WORKSPACE_ROOT,
+    retention: {
+      states: DEFAULT_WORKSPACE_RETENTION_STATES,
+      staleAfterMs: DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS,
+      checkIntervalMs: DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS,
+    },
   },
   hooks: {
     timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,

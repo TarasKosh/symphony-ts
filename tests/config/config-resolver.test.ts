@@ -13,6 +13,8 @@ import {
   DEFAULT_GITHUB_CAPABILITY_REQUIRED,
   DEFAULT_GITHUB_CREDENTIAL_SOURCE,
   DEFAULT_HOOK_TIMEOUT_MS,
+  DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS,
+  DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS,
   DEFAULT_MAX_CONCURRENT_AGENTS,
   DEFAULT_MAX_RETRY_BACKOFF_MS,
   DEFAULT_MAX_TURNS,
@@ -28,6 +30,9 @@ import {
   DEFAULT_TRACKER_CLAIM_STATE,
   DEFAULT_TRACKER_HANDOFF_STATES,
   DEFAULT_TURN_TIMEOUT_MS,
+  DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS,
+  DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS,
+  DEFAULT_WORKSPACE_RETENTION_STATES,
   DEFAULT_WORKSPACE_ROOT,
 } from "../../src/config/defaults.js";
 import { ERROR_CODES } from "../../src/errors/codes.js";
@@ -60,7 +65,18 @@ describe("config-resolver", () => {
       "Done",
     ]);
     expect(resolved.polling.intervalMs).toBe(DEFAULT_POLL_INTERVAL_MS);
+    expect(resolved.polling.issueCommentsBetweenTurns).toBe(
+      DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS,
+    );
+    expect(resolved.polling.issueCommentIgnoredAuthors).toEqual(
+      DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS,
+    );
     expect(resolved.workspace.root).toBe(DEFAULT_WORKSPACE_ROOT);
+    expect(resolved.workspace.retention).toEqual({
+      states: DEFAULT_WORKSPACE_RETENTION_STATES,
+      staleAfterMs: DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS,
+      checkIntervalMs: DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS,
+    });
     expect(resolved.hooks.timeoutMs).toBe(DEFAULT_HOOK_TIMEOUT_MS);
     expect(resolved.agent.maxConcurrentAgents).toBe(
       DEFAULT_MAX_CONCURRENT_AGENTS,
@@ -107,9 +123,16 @@ describe("config-resolver", () => {
           },
           polling: {
             interval_ms: "15000",
+            issue_comments_between_turns: "true",
+            issue_comment_ignored_authors: "Symphony Bot, Hermes_Connectio",
           },
           workspace: {
             root: "./tmp/workspaces",
+            retention: {
+              states: "Blocked, In Review, Human Review",
+              stale_after_days: "30",
+              check_interval_ms: "7200000",
+            },
           },
           hooks: {
             timeout_ms: "0",
@@ -166,7 +189,17 @@ describe("config-resolver", () => {
     expect(resolved.tracker.blockedState).toBe("Needs decision");
     expect(resolved.tracker.requireClaimBeforeAgent).toBe(false);
     expect(resolved.polling.intervalMs).toBe(15_000);
+    expect(resolved.polling.issueCommentsBetweenTurns).toBe(true);
+    expect(resolved.polling.issueCommentIgnoredAuthors).toEqual([
+      "Symphony Bot",
+      "Hermes_Connectio",
+    ]);
     expect(resolved.workspace.root).toBe(resolve("/repo/tmp/workspaces"));
+    expect(resolved.workspace.retention).toEqual({
+      states: ["Blocked", "In Review", "Human Review"],
+      staleAfterMs: 30 * 86_400_000,
+      checkIntervalMs: 7_200_000,
+    });
     expect(resolved.hooks.beforeRun).toBe("pnpm test");
     expect(resolved.hooks.timeoutMs).toBe(DEFAULT_HOOK_TIMEOUT_MS);
     expect(resolved.agent.maxConcurrentAgents).toBe(4);
@@ -776,5 +809,72 @@ describe("config-resolver", () => {
     );
 
     expect(validation).toEqual({ ok: true });
+  });
+
+  it("requires workspace retention states and age to be configured together", () => {
+    const validation = validateDispatchConfig(
+      resolveWorkflowConfig(
+        {
+          workflowPath: "/repo/WORKFLOW.md",
+          promptTemplate: "Prompt",
+          config: {
+            tracker: {
+              kind: "linear",
+              api_key: "token",
+              project_slug: "ENG",
+            },
+            workspace: {
+              retention: {
+                states: ["In Review"],
+              },
+            },
+          },
+        },
+        {},
+      ),
+    );
+
+    expect(validation).toEqual({
+      ok: false,
+      error: {
+        code: ERROR_CODES.configInvalid,
+        message:
+          "workspace.retention.states and workspace.retention.stale_after_days must be configured together.",
+      },
+    });
+  });
+
+  it("rejects retention states that could delete active or terminal workspaces", () => {
+    const validation = validateDispatchConfig(
+      resolveWorkflowConfig(
+        {
+          workflowPath: "/repo/WORKFLOW.md",
+          promptTemplate: "Prompt",
+          config: {
+            tracker: {
+              kind: "linear",
+              api_key: "token",
+              project_slug: "ENG",
+            },
+            workspace: {
+              retention: {
+                states: ["In Progress"],
+                stale_after_days: 30,
+              },
+            },
+          },
+        },
+        {},
+      ),
+    );
+
+    expect(validation).toEqual({
+      ok: false,
+      error: {
+        code: ERROR_CODES.configInvalid,
+        message:
+          "workspace.retention.states must not overlap active or terminal tracker states.",
+      },
+    });
   });
 });
