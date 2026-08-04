@@ -859,6 +859,7 @@ export class NotionTrackerClient implements IssueTracker {
 
         entries.push({
           source: "body",
+          id: readObjectString(block, "id"),
           text,
           createdAt: readObjectString(block, "created_time"),
           author: readNotionUserLabel(readObjectValue(block, "created_by")),
@@ -925,6 +926,7 @@ export class NotionTrackerClient implements IssueTracker {
 
         entries.push({
           source: "comment",
+          id: readObjectString(comment, "id"),
           text,
           createdAt: readObjectString(comment, "created_time"),
           author: readNotionUserLabel(readObjectValue(comment, "created_by")),

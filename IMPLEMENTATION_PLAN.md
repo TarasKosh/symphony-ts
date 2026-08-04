@@ -137,7 +137,19 @@ Acceptance:
 
 ### Task 7: Stabilize Ticket and Worktree Continuation
 
-Status: Planned
+Status: Partial
+
+Implemented safety slice:
+
+- Opt-in tracker comment polling re-reads ticket comments after each completed turn and adds only
+  newly observed operator comments to the next turn on the same live coding-agent thread.
+- Configured integration authors can be ignored so Symphony-authored checkpoints are not echoed
+  back to the agent.
+- Opt-in stale-workspace retention removes only non-active workspaces whose tracker issue has
+  exceeded the configured age and whose Git checkout is clean, has an upstream, and has no
+  unpushed commits. Dirty, ahead, unverifiable, and active workspaces are preserved and logged.
+
+Remaining continuation work:
 
 - Persist enough run state to distinguish a continuation from a brand-new ticket execution after
   process restarts, retries, and config reloads.
