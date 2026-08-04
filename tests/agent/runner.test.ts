@@ -154,6 +154,78 @@ describe("AgentRunner", () => {
     expect(prompts[1]).not.toContain("Initial prompt for ABC-123 attempt=2");
   });
 
+  it("delivers new tracker comments on the next turn in the same session", async () => {
+    const root = await createRoot();
+    const prompts: string[] = [];
+    const oldComment = {
+      source: "comment" as const,
+      id: "comment-old",
+      text: "Earlier context already available at session start.",
+      createdAt: "2026-07-01T08:00:00.000Z",
+      author: "Operator",
+    };
+    const userComment = {
+      source: "comment" as const,
+      id: "comment-user",
+      text: "Keep the existing API and add a regression test.",
+      createdAt: "2026-07-01T08:05:00.000Z",
+      author: "Operator",
+    };
+    const integrationComment = {
+      source: "comment" as const,
+      id: "comment-integration",
+      text: "Automated Symphony checkpoint.",
+      createdAt: "2026-07-01T08:06:00.000Z",
+      author: "Hermes_Connectio",
+    };
+    const contexts = [
+      [oldComment],
+      [oldComment, userComment, integrationComment],
+    ];
+    const tracker = {
+      ...createTracker({
+        refreshStates: [
+          { id: "issue-1", identifier: "ABC-123", state: "In Progress" },
+          { id: "issue-1", identifier: "ABC-123", state: "Done" },
+        ],
+      }),
+      readIssueContext: vi.fn(async () => ({
+        issue: { id: "issue-1", identifier: "ABC-123", state: "In Progress" },
+        entries: contexts.shift() ?? [
+          oldComment,
+          userComment,
+          integrationComment,
+        ],
+        unavailableSources: [],
+      })),
+    };
+    const config = createConfig(root, "unused");
+    config.polling.issueCommentsBetweenTurns = true;
+    config.polling.issueCommentIgnoredAuthors = ["Hermes_Connectio"];
+    const runner = new AgentRunner({
+      config,
+      tracker,
+      createCodexClient: (input) =>
+        createStubCodexClient(prompts, input, {
+          statuses: ["completed", "completed"],
+        }),
+    });
+
+    const result = await runner.run({ issue: ISSUE_FIXTURE, attempt: null });
+
+    expect(result.liveSession.threadId).toBe("thread-1");
+    expect(result.turnsCompleted).toBe(2);
+    expect(prompts[0]).toBe("Initial prompt for ABC-123 attempt=");
+    expect(prompts[1]).toContain(
+      "Keep the existing API and add a regression test.",
+    );
+    expect(prompts[1]).not.toContain(
+      "Earlier context already available at session start.",
+    );
+    expect(prompts[1]).not.toContain("Automated Symphony checkpoint.");
+    expect(tracker.readIssueContext).toHaveBeenCalledTimes(2);
+  });
+
   it("fails immediately when before_run fails and still invokes after_run best-effort", async () => {
     const root = await createRoot();
     const hooks = {

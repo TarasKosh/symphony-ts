@@ -216,6 +216,13 @@ Use these tools for ordinary checkpoints, remaining non-blocking questions, vali
 and PR references, and context refreshes. Use `symphony_block` only when the run should move the
 task to `blocked_state` and stop automatic continuation.
 
+Set `polling.issue_comments_between_turns: true` to make context refresh automatic at safe turn
+boundaries. Symphony snapshots existing comments before the first turn, then re-reads the ticket
+after each completed turn and includes only new comments in the next continuation prompt on the
+same Codex thread. It does not inject input into an already running turn. Use
+`polling.issue_comment_ignored_authors` for the Notion integration name that writes Symphony's own
+checkpoint comments so those notes are not echoed back to the agent.
+
 ### Comments
 
 Comments are optional checkpointing for ordinary progress, but `symphony_block` must leave
@@ -223,6 +230,15 @@ retrievable questions in the ticket before moving status. Enable Notion comment 
 capability for the integration token used by `NOTION_API_KEY` when available; otherwise the adapter
 records unavailable sources and falls back to appending writable notes/questions to the page body
 where supported.
+
+Example:
+
+```yaml
+polling:
+  interval_ms: 30000
+  issue_comments_between_turns: true
+  issue_comment_ignored_authors: [Hermes_Connectio]
+```
 
 ## 8. Operational notes
 

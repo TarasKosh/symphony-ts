@@ -31,6 +31,12 @@ agent can move ready PRs to the configured review state without raw tracker API 
 exposes tracker-backed ticket context tools so agents can read Notion page body/comments and append
 ordinary checkpoints or questions during the run.
 
+For trackers that expose readable comments, workflows can opt into
+`polling.issue_comments_between_turns`. Symphony then adds newly observed operator comments to the
+next Codex turn on the same live thread instead of interrupting a running turn. Optional workspace
+retention can age out abandoned non-terminal workspaces, but only after clean-Git, upstream, ahead,
+age, state, and active-run checks all pass.
+
 ## Running Symphony Locally
 
 ### Requirements
@@ -128,6 +134,8 @@ tracker:
   require_claim_before_agent: true
 workspace:
   root: ~/code/symphony-workspaces
+polling:
+  issue_comments_between_turns: true
 hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .

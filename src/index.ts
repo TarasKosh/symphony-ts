@@ -29,4 +29,5 @@ export * from "./tracker/notion-client.js";
 export * from "./tracker/notion-normalize.js";
 export * from "./tracker/tracker.js";
 export * from "./workspace/path-safety.js";
+export * from "./workspace/retention.js";
 export * from "./workspace/workspace-manager.js";

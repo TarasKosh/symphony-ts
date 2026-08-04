@@ -69,6 +69,16 @@ polling:
   # Default: 30000 (30 s)
   interval_ms: 30000
 
+  # Re-read tracker comments after each completed Codex turn and add only new
+  # comments to the next turn on the same live thread.
+  # Default: false
+  issue_comments_between_turns: false
+
+  # Optional case-insensitive integration/bot author names to suppress while
+  # still advancing the comment cursor.
+  # Default: []
+  issue_comment_ignored_authors: []
+
 # ============================================================
 # workspace — Per-issue working directory management
 # ============================================================
@@ -78,6 +88,15 @@ workspace:
   # and $ENV_VAR references.
   # Default: <os.tmpdir()>/symphony_workspaces
   root: /tmp/symphony_workspaces
+
+  # Optional guarded cleanup for abandoned non-terminal workspaces. Configure
+  # states and stale_after_days together. States must not overlap active or
+  # terminal states. Cleanup requires a clean Git checkout, a configured
+  # upstream, zero ahead commits, and no active worker.
+  # retention:
+  #   states: [Blocked, In Review, Human Review]
+  #   stale_after_days: 30
+  #   check_interval_ms: 86400000
 
 # ============================================================
 # hooks — Shell commands run at workspace lifecycle events

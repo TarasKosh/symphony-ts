@@ -14,6 +14,8 @@ import {
   DEFAULT_GITHUB_CAPABILITY_REQUIRED,
   DEFAULT_GITHUB_CREDENTIAL_SOURCE,
   DEFAULT_HOOK_TIMEOUT_MS,
+  DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS,
+  DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS,
   DEFAULT_LINEAR_ENDPOINT,
   DEFAULT_LINEAR_NETWORK_TIMEOUT_MS,
   DEFAULT_LINEAR_PAGE_SIZE,
@@ -35,6 +37,9 @@ import {
   DEFAULT_TRACKER_HANDOFF_STATES,
   DEFAULT_TRACKER_KIND,
   DEFAULT_TURN_TIMEOUT_MS,
+  DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS,
+  DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS,
+  DEFAULT_WORKSPACE_RETENTION_STATES,
   DEFAULT_WORKSPACE_ROOT,
 } from "./defaults.js";
 import type {
@@ -56,6 +61,7 @@ const TRACKER_COMMON_CONFIG_KEYS = new Set([
   "terminal_states",
 ]);
 
+const DAY_MS = 86_400_000;
 export function resolveWorkflowConfig(
   workflow: WorkflowDefinition & { workflowPath: string },
   environment: NodeJS.ProcessEnv = process.env,
@@ -64,6 +70,7 @@ export function resolveWorkflowConfig(
   const tracker = asRecord(config.tracker);
   const polling = asRecord(config.polling);
   const workspace = asRecord(config.workspace);
+  const workspaceRetention = asRecord(workspace.retention);
   const hooks = asRecord(config.hooks);
   const agent = asRecord(config.agent);
   const codex = asRecord(config.codex);
@@ -110,6 +117,13 @@ export function resolveWorkflowConfig(
     },
     polling: {
       intervalMs: readInteger(polling.interval_ms) ?? DEFAULT_POLL_INTERVAL_MS,
+      issueCommentsBetweenTurns:
+        readBoolean(polling.issue_comments_between_turns) ??
+        DEFAULT_ISSUE_COMMENTS_BETWEEN_TURNS,
+      issueCommentIgnoredAuthors: readStringList(
+        polling.issue_comment_ignored_authors,
+        DEFAULT_ISSUE_COMMENT_IGNORED_AUTHORS,
+      ),
     },
     workspace: {
       root:
@@ -118,6 +132,20 @@ export function resolveWorkflowConfig(
           workflow.workflowPath,
           environment,
         ) ?? DEFAULT_WORKSPACE_ROOT,
+      retention: {
+        states: readStringList(
+          workspaceRetention.states,
+          DEFAULT_WORKSPACE_RETENTION_STATES,
+        ),
+        staleAfterMs:
+          multiplyPositiveInteger(
+            workspaceRetention.stale_after_days,
+            DAY_MS,
+          ) ?? DEFAULT_WORKSPACE_RETENTION_STALE_AFTER_MS,
+        checkIntervalMs:
+          readPositiveInteger(workspaceRetention.check_interval_ms) ??
+          DEFAULT_WORKSPACE_RETENTION_CHECK_INTERVAL_MS,
+      },
     },
     hooks: {
       afterCreate: readScript(hooks.after_create),
@@ -191,6 +219,34 @@ export function validateDispatchConfig(
       ERROR_CODES.configInvalid,
       "codex.command must be present and non-empty before dispatch.",
     );
+  }
+
+  const retention = config.workspace.retention;
+  if (retention !== undefined) {
+    const configuredStates = retention.states.length > 0;
+    const configuredAge = retention.staleAfterMs !== null;
+    if (configuredStates !== configuredAge) {
+      return invalid(
+        ERROR_CODES.configInvalid,
+        "workspace.retention.states and workspace.retention.stale_after_days must be configured together.",
+      );
+    }
+
+    const forbiddenStates = new Set(
+      [...config.tracker.activeStates, ...config.tracker.terminalStates].map(
+        normalizeIssueState,
+      ),
+    );
+    if (
+      retention.states.some((state) =>
+        forbiddenStates.has(normalizeIssueState(state)),
+      )
+    ) {
+      return invalid(
+        ERROR_CODES.configInvalid,
+        "workspace.retention.states must not overlap active or terminal tracker states.",
+      );
+    }
   }
 
   return { ok: true };
@@ -305,6 +361,19 @@ function readPositiveInteger(value: unknown): number | null {
   }
 
   return parsed;
+}
+
+function multiplyPositiveInteger(
+  value: unknown,
+  multiplier: number,
+): number | null {
+  const parsed = readPositiveInteger(value);
+  if (parsed === null) {
+    return null;
+  }
+
+  const result = parsed * multiplier;
+  return Number.isSafeInteger(result) ? result : null;
 }
 
 function readNonNegativeInteger(value: unknown): number | null {

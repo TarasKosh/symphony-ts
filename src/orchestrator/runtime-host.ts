@@ -34,6 +34,7 @@ import {
 import { createTrackerFromConfig } from "../tracker/adapters.js";
 import type { IssueTracker } from "../tracker/tracker.js";
 import { WorkspaceHookRunner } from "../workspace/hooks.js";
+import { cleanupStaleIssueWorkspaces } from "../workspace/retention.js";
 import { WorkspaceManager } from "../workspace/workspace-manager.js";
 import type {
   OrchestratorCoreOptions,
@@ -555,6 +556,14 @@ export async function startRuntimeService(
     workspaceManager,
     logger,
   });
+  await cleanupConfiguredStaleIssueWorkspaces({
+    config: currentConfig,
+    tracker,
+    workspaceManager,
+    runtimeHost,
+    logger,
+    now: options.now?.() ?? new Date(),
+  });
 
   const dashboard =
     currentConfig.server.port === null
@@ -571,6 +580,10 @@ export async function startRuntimeService(
   const exitPromise = createExitPromise();
   let pollTimer: NodeJS.Timeout | null = null;
   let shuttingDown = false;
+  let nextWorkspaceRetentionSweepAtMs = nextRetentionSweepAtMs(
+    currentConfig,
+    options.now?.() ?? new Date(),
+  );
 
   const scheduleNextPoll = () => {
     if (stopController.signal.aborted) {
@@ -586,6 +599,21 @@ export async function startRuntimeService(
     try {
       const result = await runtimeHost.pollOnce();
       await logPollCycleResult(logger, result);
+      const cycleNow = options.now?.() ?? new Date();
+      if (cycleNow.getTime() >= nextWorkspaceRetentionSweepAtMs) {
+        await cleanupConfiguredStaleIssueWorkspaces({
+          config: currentConfig,
+          tracker,
+          workspaceManager,
+          runtimeHost,
+          logger,
+          now: cycleNow,
+        });
+        nextWorkspaceRetentionSweepAtMs = nextRetentionSweepAtMs(
+          currentConfig,
+          cycleNow,
+        );
+      }
       scheduleNextPoll();
     } catch (error) {
       await logger.error("runtime_poll_failed", toErrorMessage(error), {
@@ -630,6 +658,10 @@ export async function startRuntimeService(
               ...(usesManagedTracker ? { tracker } : {}),
               ...(usesManagedWorkspaceManager ? { workspaceManager } : {}),
             });
+            nextWorkspaceRetentionSweepAtMs = nextRetentionSweepAtMs(
+              currentConfig,
+              options.now?.() ?? new Date(),
+            );
 
             if (pollTimer !== null) {
               clearTimeout(pollTimer);
@@ -836,6 +868,80 @@ async function cleanupTerminalIssueWorkspaces(input: {
       },
     );
   }
+}
+
+async function cleanupConfiguredStaleIssueWorkspaces(input: {
+  config: ResolvedWorkflowConfig;
+  tracker: IssueTracker;
+  workspaceManager: WorkspaceManager;
+  runtimeHost: OrchestratorRuntimeHost;
+  logger: StructuredLogger;
+  now: Date;
+}): Promise<void> {
+  const retention = input.config.workspace.retention;
+  if (
+    retention === undefined ||
+    retention.states.length === 0 ||
+    retention.staleAfterMs === null
+  ) {
+    return;
+  }
+
+  try {
+    await cleanupStaleIssueWorkspaces({
+      tracker: input.tracker,
+      retention,
+      workspaceManager: input.workspaceManager,
+      now: input.now,
+      isIssueActive: (issueId) =>
+        input.runtimeHost.getState().running[issueId] !== undefined,
+      log: async (entry) => {
+        await input.logger.log(
+          entry.level,
+          entry.event,
+          entry.event === "workspace_retention_removed"
+            ? "Removed stale inactive workspace after Git safety checks."
+            : "Preserved stale inactive workspace because a safety check did not pass.",
+          {
+            outcome:
+              entry.event === "workspace_retention_removed"
+                ? "completed"
+                : "blocked",
+            issue_id: entry.issueId,
+            issue_identifier: entry.issueIdentifier,
+            workspace_path: entry.workspacePath,
+            ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+            ...(entry.detail === undefined ? {} : { detail: entry.detail }),
+          },
+        );
+      },
+    });
+  } catch (error) {
+    await input.logger.warn(
+      "workspace_retention_sweep_failed",
+      toErrorMessage(error),
+      {
+        outcome: "degraded",
+        reason: "workspace_retention_sweep_failed",
+      },
+    );
+  }
+}
+
+function nextRetentionSweepAtMs(
+  config: ResolvedWorkflowConfig,
+  now: Date,
+): number {
+  const retention = config.workspace.retention;
+  if (
+    retention === undefined ||
+    retention.states.length === 0 ||
+    retention.staleAfterMs === null
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return now.getTime() + retention.checkIntervalMs;
 }
 
 function createWorkspaceManagerFromConfig(

@@ -443,12 +443,14 @@ describe("NotionTrackerClient", () => {
       entries: [
         {
           source: "body",
+          id: "block-1",
           text: "Implement Symphony ticket context reads before blocking.",
           createdAt: "2026-07-02T08:00:00.000Z",
           author: "Operator",
         },
         {
           source: "comment",
+          id: "comment-1",
           text: "Acceptance: the agent can ask questions and write notes in the ticket.",
           createdAt: "2026-07-02T08:01:00.000Z",
           author: "Reviewer",
