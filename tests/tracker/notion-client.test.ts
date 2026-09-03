@@ -453,6 +453,14 @@ describe("NotionTrackerClient", () => {
           has_more: false,
           next_cursor: null,
         }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "user",
+          id: "integration-1",
+          type: "bot",
+          bot: {},
+        }),
       );
     const client = createClient({ fetchFn });
 
@@ -470,6 +478,7 @@ describe("NotionTrackerClient", () => {
         {
           source: "body",
           id: "block-1",
+          authorId: "user-1",
           text: "Implement Symphony ticket context reads before blocking.",
           createdAt: "2026-07-02T08:00:00.000Z",
           author: "Operator",
@@ -477,12 +486,14 @@ describe("NotionTrackerClient", () => {
         {
           source: "comment",
           id: "comment-1",
+          authorId: "user-2",
           text: "Acceptance: the agent can ask questions and write notes in the ticket.",
           createdAt: "2026-07-02T08:01:00.000Z",
           author: "Reviewer",
         },
       ],
       unavailableSources: [],
+      selfAuthorId: "integration-1",
     });
 
     const bodyUrl = new URL(fetchFn.mock.calls[0]?.[0] as string);
@@ -493,7 +504,92 @@ describe("NotionTrackerClient", () => {
     expect(commentsUrl.pathname).toBe("/v1/comments");
     expect(commentsUrl.searchParams.get("block_id")).toBe("page-1");
     expect(commentsUrl.searchParams.get("page_size")).toBe("100");
+
+    const userUrl = new URL(fetchFn.mock.calls[2]?.[0] as string);
+    expect(userUrl.pathname).toBe("/v1/users/me");
   });
+
+  it("caches a valid bot identity across ticket context reads", async () => {
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/users/me") {
+        return jsonResponse({
+          object: "user",
+          id: "integration-1",
+          type: "bot",
+          bot: {},
+        });
+      }
+      return jsonResponse({
+        object: "list",
+        results: [],
+        has_more: false,
+        next_cursor: null,
+      });
+    });
+    const client = createClient({ fetchFn });
+    const issue = createIssue({ id: "page-1", state: "In Progress" });
+
+    await expect(client.readIssueContext({ issue })).resolves.toMatchObject({
+      selfAuthorId: "integration-1",
+    });
+    await expect(client.readIssueContext({ issue })).resolves.toMatchObject({
+      selfAuthorId: "integration-1",
+    });
+
+    expect(
+      fetchFn.mock.calls.filter(
+        ([input]) => new URL(String(input)).pathname === "/v1/users/me",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it.each(["rejected", "malformed"] as const)(
+    "retries a %s bot identity lookup on the next context read",
+    async (failureKind) => {
+      let identityRequests = 0;
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/v1/users/me") {
+          identityRequests += 1;
+          if (identityRequests === 1) {
+            if (failureKind === "rejected") {
+              throw new Error("identity request failed");
+            }
+            return jsonResponse({ object: "user", id: "", type: "bot" });
+          }
+          return jsonResponse({
+            object: "user",
+            id: "integration-1",
+            type: "bot",
+            bot: {},
+          });
+        }
+        return jsonResponse({
+          object: "list",
+          results: [],
+          has_more: false,
+          next_cursor: null,
+        });
+      });
+      const client = createClient({ fetchFn });
+      const issue = createIssue({ id: "page-1", state: "In Progress" });
+
+      await expect(client.readIssueContext({ issue })).resolves.toEqual({
+        issue: {
+          id: "page-1",
+          identifier: "NOTION-1",
+          state: "In Progress",
+        },
+        entries: [],
+        unavailableSources: [],
+      });
+      await expect(client.readIssueContext({ issue })).resolves.toMatchObject({
+        selfAuthorId: "integration-1",
+      });
+      expect(identityRequests).toBe(2);
+    },
+  );
 
   it("omits missing or inaccessible pages during state refresh", async () => {
     const fetchFn = vi

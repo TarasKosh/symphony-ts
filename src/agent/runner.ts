@@ -759,6 +759,15 @@ export class AgentRunner {
       }
       cursor.seen.add(key);
 
+      const selfAuthorId = context.selfAuthorId;
+      if (
+        selfAuthorId !== undefined &&
+        selfAuthorId !== "" &&
+        entry.authorId === selfAuthorId
+      ) {
+        continue;
+      }
+
       const author = normalizeTrackerAuthor(entry.author ?? "");
       if (author !== "" && ignoredAuthors.has(author)) {
         continue;
