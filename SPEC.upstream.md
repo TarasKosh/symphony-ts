@@ -395,6 +395,14 @@ Fields:
   - Matching is case-insensitive and suppresses comments created by configured integrations or
     bots while still advancing the in-memory comment cursor.
 
+When issue-comment polling is enabled, a tracker may also return stable author IDs for entries and
+the authenticated bot's own stable ID. The runner suppresses a comment when both IDs are non-empty
+and exactly equal, after advancing the in-memory cursor. This automatic self-comment filter does not
+require configuration and is additive to `issue_comment_ignored_authors`. Identity lookup is
+best-effort: a valid bot identity is cached, while a rejected, malformed, or non-bot response fails
+open for the current turn boundary and is retried on the next context read. Ticket-context reads keep
+the full body and comment history; filtering applies only to continuation-prompt injection.
+
 #### 5.3.3 `workspace` (object)
 
 Fields:
@@ -834,8 +842,8 @@ Important nuance:
   original task prompt that is already present in thread history.
 - When `polling.issue_comments_between_turns` is enabled, the runner should establish a comment
   baseline before the first turn and re-read ticket comments after each completed active-state
-  turn. Newly observed, non-ignored comments are included in the next continuation prompt; they are
-  never injected into a turn that is already running.
+  turn. Newly observed comments that are neither self-authored nor configured-ignored are included
+  in the next continuation prompt; they are never injected into a turn that is already running.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.

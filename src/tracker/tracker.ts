@@ -32,6 +32,7 @@ export interface TrackerBlockerMetadata {
 export interface TrackerIssueContextEntry {
   source: "body" | "comment";
   id?: string | null;
+  authorId?: string;
   text: string;
   createdAt: string | null;
   author: string | null;
@@ -46,6 +47,7 @@ export interface TrackerIssueContext {
   issue: IssueStateSnapshot;
   entries: TrackerIssueContextEntry[];
   unavailableSources: TrackerIssueContextUnavailableSource[];
+  selfAuthorId?: string;
 }
 
 export interface TrackerIssueNoteMetadata {

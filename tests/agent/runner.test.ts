@@ -228,6 +228,69 @@ describe("AgentRunner", () => {
     expect(tracker.readIssueContext).toHaveBeenCalledTimes(2);
   });
 
+  it("delivers human comments but suppresses self comments by stable author ID", async () => {
+    const root = await createRoot();
+    const prompts: string[] = [];
+    const oldComment = {
+      source: "comment" as const,
+      id: "comment-old",
+      authorId: "human-1",
+      text: "Earlier context already available at session start.",
+      createdAt: "2026-07-01T08:00:00.000Z",
+      author: "Operator",
+    };
+    const humanComment = {
+      source: "comment" as const,
+      id: "comment-human",
+      authorId: "human-1",
+      text: "Please keep this human instruction.",
+      createdAt: "2026-07-01T08:05:00.000Z",
+      author: "Operator",
+    };
+    const selfComment = {
+      source: "comment" as const,
+      id: "comment-self",
+      authorId: "integration-1",
+      text: "Automated Symphony checkpoint from a renamed integration.",
+      createdAt: "2026-07-01T08:06:00.000Z",
+      author: "Renamed Connector",
+    };
+    const contexts = [[oldComment], [oldComment, humanComment, selfComment]];
+    const tracker = {
+      ...createTracker({
+        refreshStates: [
+          { id: "issue-1", identifier: "ABC-123", state: "In Progress" },
+          { id: "issue-1", identifier: "ABC-123", state: "Done" },
+        ],
+      }),
+      readIssueContext: vi.fn(async () => ({
+        issue: { id: "issue-1", identifier: "ABC-123", state: "In Progress" },
+        entries: contexts.shift() ?? [oldComment, humanComment, selfComment],
+        unavailableSources: [],
+        selfAuthorId: "integration-1",
+      })),
+    };
+    const config = createConfig(root, "unused");
+    config.polling.issueCommentsBetweenTurns = true;
+    const runner = new AgentRunner({
+      config,
+      tracker,
+      createCodexClient: (input) =>
+        createStubCodexClient(prompts, input, {
+          statuses: ["completed", "completed"],
+        }),
+    });
+
+    const result = await runner.run({ issue: ISSUE_FIXTURE, attempt: null });
+
+    expect(result.turnsCompleted).toBe(2);
+    expect(prompts[1]).toContain("Please keep this human instruction.");
+    expect(prompts[1]).not.toContain(
+      "Automated Symphony checkpoint from a renamed integration.",
+    );
+    expect(tracker.readIssueContext).toHaveBeenCalledTimes(2);
+  });
+
   it("fails immediately when before_run fails and still invokes after_run best-effort", async () => {
     const root = await createRoot();
     const hooks = {

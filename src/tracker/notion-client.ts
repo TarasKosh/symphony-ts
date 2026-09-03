@@ -110,6 +110,7 @@ export class NotionTrackerClient implements IssueTracker {
   private readonly fetchFn: typeof fetch;
   private readonly adapterOptions: NotionTrackerAdapterOptions;
   private schemaPromise: Promise<NotionResolvedSchema> | null = null;
+  private selfAuthorId: string | null = null;
 
   constructor(options: NotionTrackerClientOptions) {
     this.endpoint = options.endpoint ?? DEFAULT_NOTION_ENDPOINT;
@@ -181,10 +182,12 @@ export class NotionTrackerClient implements IssueTracker {
   }): Promise<TrackerIssueContext> {
     const entries: TrackerIssueContextEntry[] = [];
     const unavailableSources: TrackerIssueContext["unavailableSources"] = [];
-    const [bodyResult, commentsResult] = await Promise.allSettled([
-      this.readPageBodyEntries(input.issue.id),
-      this.readPageCommentEntries(input.issue.id),
-    ]);
+    const [bodyResult, commentsResult, selfAuthorIdResult] =
+      await Promise.allSettled([
+        this.readPageBodyEntries(input.issue.id),
+        this.readPageCommentEntries(input.issue.id),
+        this.readSelfAuthorId(),
+      ]);
 
     if (bodyResult.status === "fulfilled") {
       entries.push(...bodyResult.value);
@@ -220,6 +223,10 @@ export class NotionTrackerClient implements IssueTracker {
       },
       entries,
       unavailableSources,
+      ...(selfAuthorIdResult.status === "fulfilled" &&
+      selfAuthorIdResult.value !== null
+        ? { selfAuthorId: selfAuthorIdResult.value }
+        : {}),
     };
   }
 
@@ -856,13 +863,16 @@ export class NotionTrackerClient implements IssueTracker {
         if (text === null) {
           continue;
         }
+        const createdBy = readObjectValue(block, "created_by");
+        const authorId = readObjectString(createdBy, "id");
 
         entries.push({
           source: "body",
           id: readObjectString(block, "id"),
+          ...(authorId === null ? {} : { authorId }),
           text,
           createdAt: readObjectString(block, "created_time"),
-          author: readNotionUserLabel(readObjectValue(block, "created_by")),
+          author: readNotionUserLabel(createdBy),
         });
       }
 
@@ -923,13 +933,16 @@ export class NotionTrackerClient implements IssueTracker {
         if (text === null) {
           continue;
         }
+        const createdBy = readObjectValue(comment, "created_by");
+        const authorId = readObjectString(createdBy, "id");
 
         entries.push({
           source: "comment",
           id: readObjectString(comment, "id"),
+          ...(authorId === null ? {} : { authorId }),
           text,
           createdAt: readObjectString(comment, "created_time"),
-          author: readNotionUserLabel(readObjectValue(comment, "created_by")),
+          author: readNotionUserLabel(createdBy),
         });
       }
 
@@ -952,6 +965,29 @@ export class NotionTrackerClient implements IssueTracker {
     }
 
     return entries;
+  }
+
+  private async readSelfAuthorId(): Promise<string | null> {
+    if (this.selfAuthorId !== null) {
+      return this.selfAuthorId;
+    }
+
+    const response = await this.requestJson<unknown>({
+      method: "GET",
+      path: "/users/me",
+    });
+    if (
+      readObjectString(response, "object") !== "user" ||
+      readObjectString(response, "type") !== "bot"
+    ) {
+      return null;
+    }
+
+    const authorId = readObjectString(response, "id");
+    if (authorId !== null) {
+      this.selfAuthorId = authorId;
+    }
+    return authorId;
   }
 
   private async requestJson<T>(input: {
