@@ -15,6 +15,32 @@ import {
 import type { ResolvedWorkflowConfig } from "../../src/config/types.js";
 
 describe("cli", () => {
+  it.each(["--help", "-h"])(
+    "shows the help aliases without starting the host for %s",
+    async (flag) => {
+      const stdout = vi.fn();
+      const stderr = vi.fn();
+      const loadWorkflowDefinition = vi.fn();
+      const startHost = vi.fn();
+
+      const exitCode = await runCli([flag], {
+        io: { stdout, stderr },
+        loadWorkflowDefinition,
+        startHost,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(stdout).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "-h, --help                   show this help text",
+        ),
+      );
+      expect(stderr).not.toHaveBeenCalled();
+      expect(loadWorkflowDefinition).not.toHaveBeenCalled();
+      expect(startHost).not.toHaveBeenCalled();
+    },
+  );
+
   it("parses the workflow path and CLI override flags", () => {
     expect(
       parseCliArgs([

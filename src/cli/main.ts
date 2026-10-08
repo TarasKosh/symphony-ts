@@ -281,7 +281,7 @@ function renderUsage(): string {
     `  ${CLI_ACKNOWLEDGEMENT_FLAG}  required before startup`,
     "  --logs-root <path>           override the logs root directory",
     "  --port <number>              override the HTTP server port",
-    "  --help                       show this help text",
+    "  -h, --help                   show this help text",
     "",
   ].join("\n");
 }
