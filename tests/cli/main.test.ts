@@ -31,7 +31,9 @@ describe("cli", () => {
 
       expect(exitCode).toBe(0);
       expect(stdout).toHaveBeenCalledWith(
-        expect.stringContaining("-h, --help                   show this help text"),
+        expect.stringContaining(
+          "-h, --help                   show this help text",
+        ),
       );
       expect(stderr).not.toHaveBeenCalled();
       expect(loadWorkflowDefinition).not.toHaveBeenCalled();
